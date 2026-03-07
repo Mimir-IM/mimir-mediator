@@ -1,0 +1,22 @@
+[package]
+name = "mimir-mediator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ygg_stream = { path = "../ygg_stream" }
+turso = "0.4"
+moka = { version = "0.12", features = ["future"] }
+redb = "2"
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+getopts = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+hex = "0.4"
+
+[[bin]]
+name = "stress_test"
+path = "src/bin/stress_test.rs"
