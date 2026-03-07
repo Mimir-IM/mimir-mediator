@@ -1,5 +1,5 @@
 use moka::future::Cache;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
