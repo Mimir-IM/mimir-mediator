@@ -134,7 +134,7 @@ impl ServerState {
                 {
                     let _guard = self.db.write_mu.lock().await;
                     let q = format!("UPDATE \"{}\" SET last_seen=?1 WHERE pubkey=?2", users_tbl);
-                    let _ = self.db.conn.execute(&q, turso::params![timestamp, pub_key.as_slice()]).await;
+                    let _ = client.db_conn.execute(&q, turso::params![timestamp, pub_key.as_slice()]).await;
                 }
 
                 let state = self.clone_arc();

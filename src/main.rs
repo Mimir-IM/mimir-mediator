@@ -88,7 +88,7 @@ async fn main() {
 
     // Init hybrid cache
     let cache_ttl = Duration::from_secs(cache_days * 24 * 3600);
-    let cache_path = PathBuf::from("mediator-cache.redb");
+    let cache_path = PathBuf::from("mediator-cache");
     let cache = match cache::HybridCache::new(&cache_path, 512 * 1024 * 1024, cache_ttl) {
         Ok(c) => c,
         Err(e) => {

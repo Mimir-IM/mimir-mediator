@@ -9,6 +9,7 @@ use tracing::{debug};
 pub struct ClientConn {
     pub id: ClientId,
     pub conn: ygg_stream::AsyncConn,
+    pub db_conn: turso::Connection,
     pub authed: RwLock<bool>,
     pub pub_key: RwLock<[u8; 32]>,
     pub chats: RwLock<HashSet<i64>>,
@@ -17,11 +18,12 @@ pub struct ClientConn {
 }
 
 impl ClientConn {
-    pub fn new(id: ClientId, conn: ygg_stream::AsyncConn) -> Arc<Self> {
+    pub fn new(id: ClientId, conn: ygg_stream::AsyncConn, db_conn: turso::Connection) -> Arc<Self> {
         let addr = hex::encode(conn.public_key());
         Arc::new(Self {
             id,
             conn,
+            db_conn,
             authed: RwLock::new(false),
             pub_key: RwLock::new([0u8; 32]),
             chats: RwLock::new(HashSet::new()),
@@ -103,7 +105,14 @@ impl ClientConn {
 
 /// Serve a single client connection.
 pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, client_id: ClientId) {
-    let client = ClientConn::new(client_id, conn);
+    let db_conn = match state.db.connect() {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("client {}: failed to create db connection: {}", client_id, e);
+            return;
+        }
+    };
+    let client = ClientConn::new(client_id, conn, db_conn);
 
     // Read init bytes: [version:1][protoType:1]
     {

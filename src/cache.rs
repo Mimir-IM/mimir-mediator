@@ -1,16 +1,16 @@
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use moka::future::Cache;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blobs");
-
-/// Two-tier cache: moka (RAM, 2-min TTL) + redb (disk, configurable TTL).
+/// Two-tier cache: moka (RAM, 2-min TTL) + fjall (disk, configurable TTL).
 pub struct HybridCache {
     mem: Cache<String, Vec<u8>>,
-    disk: Database,
+    #[allow(dead_code)]
+    db: Database,
+    blobs: Keyspace,
     disk_ttl: Duration,
 }
 
@@ -21,16 +21,10 @@ impl HybridCache {
             .time_to_live(Duration::from_secs(120))
             .build();
 
-        let disk = Database::create(db_path)?;
+        let db = Database::builder(db_path).open()?;
+        let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
 
-        // Ensure table exists
-        let write_txn = disk.begin_write()?;
-        {
-            let _ = write_txn.open_table(TABLE)?;
-        }
-        write_txn.commit()?;
-
-        Ok(Arc::new(Self { mem, disk, disk_ttl }))
+        Ok(Arc::new(Self { mem, db, blobs, disk_ttl }))
     }
 
     /// Store value in both RAM and disk tiers.
@@ -52,12 +46,7 @@ impl HybridCache {
     }
 
     fn disk_set(&self, key: &str, entry: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let write_txn = self.disk.begin_write()?;
-        {
-            let mut table = write_txn.open_table(TABLE)?;
-            table.insert(key, entry)?;
-        }
-        write_txn.commit()?;
+        self.blobs.insert(key, entry)?;
         Ok(())
     }
 
@@ -91,16 +80,13 @@ impl HybridCache {
     }
 
     fn disk_get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_txn = self.disk.begin_read()?;
-        let table = read_txn.open_table(TABLE)?;
-        match table.get(key)? {
-            Some(guard) => {
-                let entry = guard.value();
-                if entry.len() < 8 {
+        match self.blobs.get(key)? {
+            Some(slice) => {
+                if slice.len() < 8 {
                     return Ok(None);
                 }
-                let ts = u64::from_be_bytes(entry[..8].try_into().unwrap());
-                let val = entry[8..].to_vec();
+                let ts = u64::from_be_bytes(slice[..8].try_into().unwrap());
+                let val = slice[8..].to_vec();
                 Ok(Some((ts, val)))
             }
             None => Ok(None),
@@ -115,49 +101,28 @@ impl HybridCache {
             .as_secs();
         let cutoff = now.saturating_sub(self.disk_ttl.as_secs());
 
-        let write_txn = match self.disk.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("cache gc: begin_write failed: {}", e);
-                return;
-            }
-        };
-        {
-            let mut table = match write_txn.open_table(TABLE) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("cache gc: open_table failed: {}", e);
-                    return;
-                }
-            };
-
-            // Collect expired keys
-            let expired: Vec<String> = {
-                let mut keys = Vec::new();
-                let range = match table.iter() {
-                    Ok(i) => i,
-                    Err(_) => return,
-                };
-                for entry in range {
-                    if let Ok(entry) = entry {
-                        let val = entry.1.value();
-                        if val.len() >= 8 {
-                            let ts = u64::from_be_bytes(val[..8].try_into().unwrap());
-                            if ts < cutoff {
-                                keys.push(entry.0.value().to_string());
-                            }
+        let mut expired: Vec<Vec<u8>> = Vec::new();
+        for guard in self.blobs.iter() {
+            match guard.into_inner() {
+                Ok((key, val)) => {
+                    if val.len() >= 8 {
+                        let ts = u64::from_be_bytes(val[..8].try_into().unwrap());
+                        if ts < cutoff {
+                            expired.push(key.to_vec());
                         }
                     }
                 }
-                keys
-            };
-
-            for key in &expired {
-                let _: Result<_, _> = table.remove(key.as_str());
+                Err(e) => {
+                    warn!("cache gc: iter error: {}", e);
+                    return;
+                }
             }
         }
-        if let Err(e) = write_txn.commit() {
-            warn!("cache gc: commit failed: {}", e);
+
+        for key in &expired {
+            if let Err(e) = self.blobs.remove(key.as_slice()) {
+                warn!("cache gc: remove failed: {}", e);
+            }
         }
     }
 }

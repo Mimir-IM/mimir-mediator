@@ -7,7 +7,7 @@ edition = "2024"
 ygg_stream = { path = "../ygg_stream" }
 turso = "0.5.0"
 moka = { version = "0.12", features = ["future"] }
-redb = "3.1.0"
+fjall = "3.1"
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

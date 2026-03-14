@@ -49,7 +49,7 @@ pub const SYS_MEMBER_ONLINE: u8 = 0x09;
 pub const MAX_NAME_LEN: usize = 25;
 pub const MAX_DESC_LEN: usize = 200;
 pub const MAX_AVATAR_BYTES: usize = 200 * 1024;
-pub const MAX_PAYLOAD: u32 = 32 << 20; // 32 MB
+pub const MAX_PAYLOAD: u32 = 51 * 1024 * 1024; // 50 MB + meta-data
 
 // File names
 pub const DB_FILE: &str = "mediator.db";
