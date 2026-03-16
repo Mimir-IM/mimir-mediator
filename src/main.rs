@@ -1,4 +1,3 @@
-mod cache;
 mod client;
 mod constants;
 mod db;
@@ -7,7 +6,6 @@ mod permissions;
 mod server;
 mod tlv;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
@@ -27,7 +25,6 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut opts = getopts::Options::new();
     opts.optmulti("p", "peer", "Yggdrasil peer URI (repeatable)", "URI");
-    opts.optopt("c", "cache-days", "Days to cache messages (default: 1)", "DAYS");
     opts.optflag("h", "help", "Show help");
 
     let matches = match opts.parse(&args[1..]) {
@@ -50,11 +47,6 @@ async fn main() {
         eprintln!("{}", opts.usage(&format!("Usage: {} [options]", args[0])));
         std::process::exit(1);
     }
-
-    let cache_days: u64 = matches
-        .opt_str("c")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
 
     // Load or generate Ed25519 keypair
     let signing_key = load_or_gen_key(constants::KEY_FILE);
@@ -86,34 +78,13 @@ async fn main() {
         }
     };
 
-    // Init hybrid cache
-    let cache_ttl = Duration::from_secs(cache_days * 24 * 3600);
-    let cache_path = PathBuf::from("mediator-cache");
-    let cache = match cache::HybridCache::new(&cache_path, 512 * 1024 * 1024, cache_ttl) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to init cache: {}", e);
-            std::process::exit(1);
-        }
-    };
-
     // Build server state
-    let state = server::ServerState::new(db, cache.clone(), pub_bytes, signing_key);
+    let state = server::ServerState::new(db, pub_bytes, signing_key);
 
     // Start invite cleanup worker
     let state2 = state.clone();
     tokio::spawn(async move {
         handlers::invite_cleanup_worker(state2).await;
-    });
-
-    // Start cache GC worker
-    let cache2 = cache.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
-        loop {
-            interval.tick().await;
-            cache2.gc();
-        }
     });
 
     info!("listening for client requests…");

@@ -23,7 +23,7 @@ pub async fn dispatch(state: &Arc<ServerState>, cc: &Arc<ClientConn>, cmd: u8, r
         CMD_GET_USER_CHATS => handle_get_user_chats(state, cc, req_id, payload).await,
         CMD_LEAVE_CHAT => handle_leave_chat(state, cc, req_id, payload).await,
         CMD_SUBSCRIBE => handle_subscribe(state, cc, req_id, payload).await,
-        CMD_GET_MESSAGES_SINCE => handle_get_messages_since(state, cc, req_id, payload).await,
+        CMD_GET_MESSAGES_SINCE => handle_get_messages_since(cc, req_id, payload).await,
         CMD_SEND_MESSAGE => handle_send_message(state, cc, req_id, payload).await,
         CMD_DELETE_MESSAGE => handle_delete_message(state, cc, req_id, payload).await,
         CMD_GET_LAST_MESSAGE_ID => handle_get_last_message_id(state, cc, req_id, payload).await,
@@ -916,7 +916,7 @@ async fn handle_subscribe(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
     });
 }
 
-async fn handle_get_messages_since(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+async fn handle_get_messages_since(cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
     if !cc.is_authed().await {
         let _ = cc.write_err(req_id, "auth required").await;
         return;
@@ -951,7 +951,7 @@ async fn handle_get_messages_since(state: &Arc<ServerState>, cc: &Arc<ClientConn
     }
 
     let msg_tbl = format!("messages-{}", chat_id);
-    let q = format!("SELECT id, guid, ts, author FROM \"{}\" WHERE id>?1 ORDER BY id ASC LIMIT ?2", msg_tbl);
+    let q = format!("SELECT id, guid, ts, author, blob FROM \"{}\" WHERE id>?1 ORDER BY id ASC LIMIT ?2", msg_tbl);
     let mut rows = match cc.db_conn.query(&q, turso::params![since_id, limit as i64]).await {
         Ok(r) => r,
         Err(_) => { let _ = cc.write_err(req_id, "db error").await; return; }
@@ -971,12 +971,7 @@ async fn handle_get_messages_since(state: &Arc<ServerState>, cc: &Arc<ClientConn
         let guid: i64 = row.get(1).unwrap_or(0);
         let ts: i64 = row.get(2).unwrap_or(0);
         let author: Vec<u8> = row.get(3).unwrap_or_default();
-
-        let key = format!("{:016x}:{:016x}", chat_id, guid);
-        let blob = match state.cache.get(&key).await {
-            Some(b) => b,
-            None => continue,
-        };
+        let blob: Vec<u8> = row.get(4).unwrap_or_default();
 
         msgs.push(Msg { id, guid, ts, author, blob });
     }
@@ -1032,9 +1027,9 @@ async fn handle_send_message(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req
     let mut success = false;
 
     for _attempt in 0..10 {
-        let q = format!("INSERT INTO \"{}\"(ts, guid, author) VALUES(?1,?2,?3)", msg_tbl);
+        let q = format!("INSERT INTO \"{}\"(ts, guid, author, blob) VALUES(?1,?2,?3,?4)", msg_tbl);
         let _guard = state.db.write_mu.lock().await;
-        match cc.db_conn.execute(&q, turso::params![timestamp, guid, cc_pub.as_slice()]).await {
+        match cc.db_conn.execute(&q, turso::params![timestamp, guid, cc_pub.as_slice(), blob.as_slice()]).await {
             Ok(_) => {
                 // Get last insert rowid
                 let id_q = format!("SELECT id FROM \"{}\" WHERE guid=?1", msg_tbl);
@@ -1083,10 +1078,6 @@ async fn handle_send_message(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req
         let _ = cc.write_err(req_id, "db error - guid collision limit exceeded").await;
         return;
     }
-
-    // Store blob in cache
-    let key = format!("{:016x}:{:016x}", chat_id, guid);
-    state.cache.set(&key, &blob).await;
 
     // Broadcast
     let broadcast_payload = build_tlv_payload(|w| {
@@ -1637,8 +1628,8 @@ pub async fn broadcast_system_message(
         let msg_tbl = format!("messages-{}", chat_id);
         let _guard = state.db.write_mu.lock().await;
         if let Err(e) = conn.execute(
-            &format!("INSERT INTO \"{}\"(ts, guid, author) VALUES(?1,?2,?3)", msg_tbl),
-            turso::params![timestamp, guid, state.mediator_pub.as_slice()],
+            &format!("INSERT INTO \"{}\"(ts, guid, author, blob) VALUES(?1,?2,?3,?4)", msg_tbl),
+            turso::params![timestamp, guid, state.mediator_pub.as_slice(), body],
         ).await {
             return Err(format!("failed to insert system message: {}", e));
         }
@@ -1652,9 +1643,6 @@ pub async fn broadcast_system_message(
             }
         }
 
-        // Store in cache
-        let key = format!("{:016x}:{:016x}", chat_id, guid);
-        state.cache.set(&key, body).await;
     }
 
     let broadcast_payload = build_tlv_payload(|w| {

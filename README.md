@@ -5,7 +5,7 @@ A mediator server for the Mimir messaging protocol, built on top of the [Yggdras
 ## Overview
 
 mimir-mediator handles chat operations — authentication, group management, message routing, invites, and member permissions — over Yggdrasil using a compact TLV-based binary protocol.
-Messages are persisted in a Turso (libSQL) database with an in-memory + on-disk hybrid cache (Moka + redb) for fast delivery.
+Messages and their blobs are persisted in a Turso (libSQL) database.
 
 ## Building
 
@@ -20,7 +20,6 @@ mimir-mediator [options]
 
 Options:
   -p, --peer URI        Yggdrasil peer URI (repeatable, at least one required)
-  -c, --cache-days DAYS Days to cache messages (default: 1)
   -h, --help            Show help
 ```
 

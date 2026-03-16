@@ -1,4 +1,3 @@
-use crate::cache::HybridCache;
 use crate::client::ClientConn;
 use crate::db::Db;
 use crate::constants::*;
@@ -12,7 +11,6 @@ pub type ClientId = u64;
 
 pub struct ServerState {
     pub db: Arc<Db>,
-    pub cache: Arc<HybridCache>,
     pub mediator_pub: [u8; 32],
     #[allow(dead_code)]
     pub mediator_priv: ed25519_dalek::SigningKey,
@@ -36,13 +34,11 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(
         db: Arc<Db>,
-        cache: Arc<HybridCache>,
         mediator_pub: [u8; 32],
         mediator_priv: ed25519_dalek::SigningKey,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
-            cache,
             mediator_pub,
             mediator_priv,
             chat_subs: RwLock::new(HashMap::new()),

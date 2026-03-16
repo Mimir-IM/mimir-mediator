@@ -49,6 +49,20 @@ impl Db {
             (),
         ).await?;
 
+        // Migration: add blob column to existing message tables
+        {
+            let mut rows = conn.query("SELECT id FROM chats", ()).await?;
+            let mut chat_ids = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0).unwrap_or(0);
+                chat_ids.push(id);
+            }
+            for id in chat_ids {
+                let alter = format!("ALTER TABLE \"messages-{}\" ADD COLUMN blob BLOB NOT NULL DEFAULT X''", id);
+                let _ = conn.execute(&alter, ()).await; // ignore "duplicate column" errors
+            }
+        }
+
         Ok(Arc::new(Self {
             db,
             write_mu: Mutex::new(()),
@@ -100,18 +114,8 @@ impl Db {
         )
         .await?;
 
-        conn.execute(
-            &format!(
-                "CREATE TABLE \"{}\"(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts INTEGER NOT NULL,
-                    guid INTEGER NOT NULL UNIQUE,
-                    author BLOB(32) NOT NULL
-                )",
-                messages
-            ),
-            (),
-        )
+        conn.execute(&format!("CREATE TABLE \"{}\"(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,\
+            guid INTEGER NOT NULL UNIQUE, author BLOB(32) NOT NULL, blob BLOB NOT NULL DEFAULT X'')", messages),())
         .await?;
 
         Ok(())
@@ -120,11 +124,7 @@ impl Db {
 
 /// Helper to get table names for a chat.
 pub fn chat_table_names(id: i64) -> (String, String, String) {
-    (
-        format!("settings-{}", id),
-        format!("users-{}", id),
-        format!("messages-{}", id),
-    )
+    (format!("settings-{}", id), format!("users-{}", id), format!("messages-{}", id))
 }
 
 /// Generate a message GUID matching the Kotlin contentHashCode algorithm.
