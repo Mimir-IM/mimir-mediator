@@ -126,7 +126,7 @@ impl ServerState {
 
             // Update last_seen and broadcast offline
             for &chat_id in &chats_to_notify {
-                let users_tbl = format!("users-{}", chat_id);
+                let users_tbl = format!("users_{}", chat_id);
                 {
                     let _guard = self.db.write_mu.lock().await;
                     let q = format!("UPDATE \"{}\" SET last_seen=?1 WHERE pubkey=?2", users_tbl);
@@ -229,8 +229,9 @@ pub async fn run_accept_loop(state: Arc<ServerState>, node: Arc<ygg_stream::Asyn
         };
 
         let client_id = state.next_id();
+        let num_clients = state.clients.read().await.len() + 1;
         let remote_pub = conn.public_key();
-        info!("Client {}: connected from {}", client_id, hex::encode(&remote_pub));
+        info!("Client {}: connected from {}, total {}", client_id, hex::encode(&remote_pub), num_clients);
 
         let state2 = state.clone();
         tokio::spawn(async move {

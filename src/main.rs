@@ -6,8 +6,11 @@ mod permissions;
 mod server;
 mod tlv;
 
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use tracing::{error, info};
 use crate::constants::SERVER_PORT;
 
@@ -17,7 +20,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug,turso_core=info,yggdrasil=info,ironwood=info,ygg_stream=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,turso_core=info,yggdrasil=info,ironwood=info,ygg_stream=info")),
         )
         .init();
 
@@ -53,7 +56,7 @@ async fn main() {
     let verifying_key = signing_key.verifying_key();
     let pub_bytes: [u8; 32] = verifying_key.to_bytes();
 
-    info!("mediator started; pubkey: {}", hex::encode(&pub_bytes));
+    info!("Mediator started; pubkey: {}", hex::encode(&pub_bytes));
 
     // Init ygg_stream AsyncNode
     let node = match ygg_stream::AsyncNode::new_with_key(
@@ -87,7 +90,7 @@ async fn main() {
         handlers::invite_cleanup_worker(state2).await;
     });
 
-    info!("listening for client requests…");
+    info!("Listening for client requests…");
 
     // Run accept loop until Ctrl+C
     tokio::select! {
@@ -102,52 +105,38 @@ async fn main() {
 }
 
 /// Load Ed25519 private key from file, or generate and save a new one.
-fn load_or_gen_key(path: &str) -> ed25519_dalek::SigningKey {
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-
-    // Try to load existing key (64-byte format: seed || public, we only need first 32)
-    if let Ok(bytes) = std::fs::read(path) {
-        if bytes.len() == 64 {
-            // Go Ed25519 private key format: 32-byte seed + 32-byte public key
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&bytes[..32]);
+pub fn load_or_gen_key(path: &str) -> SigningKey {
+    if let Ok(data) = fs::read(path) {
+        let seed: Option<[u8; 32]> = if data.len() == 32 {
+            Some(data.try_into().unwrap())
+        } else if data.len() == 64 {
+            // Try to parse as hex-encoded seed
+            let text = String::from_utf8_lossy(&data);
+            let text = text.trim();
+            hex::decode(text).ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        } else {
+            // Handle hex with possible trailing newline/whitespace
+            let text = String::from_utf8_lossy(&data);
+            let text = text.trim();
+            if text.len() == 64 {
+                hex::decode(text).ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            } else {
+                None
+            }
+        };
+        if let Some(seed) = seed {
             let key = SigningKey::from_bytes(&seed);
-            info!(
-                "Loaded mediator key from {} – public: {}",
-                path,
-                hex::encode(key.verifying_key().as_bytes())
-            );
-            return key;
-        } else if bytes.len() == 32 {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&bytes);
-            let key = SigningKey::from_bytes(&seed);
-            info!(
-                "Loaded mediator key from {} – public: {}",
-                path,
-                hex::encode(key.verifying_key().as_bytes())
-            );
+            info!("Loaded key from {}, public: {}", path, hex::encode(key.verifying_key().as_bytes()));
             return key;
         }
     }
 
-    // Generate new key
     let key = SigningKey::generate(&mut OsRng);
-    // Save in Go-compatible 64-byte format: seed + public
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(key.as_bytes());
-    buf[32..].copy_from_slice(key.verifying_key().as_bytes());
-
-    if let Err(e) = std::fs::write(path, &buf) {
-        error!("Failed to save key to {}: {}", path, e);
-        std::process::exit(1);
+    if let Err(e) = fs::write(path, key.to_bytes()) {
+        error!("Failed to save key: {}", e);
     }
-
-    info!(
-        "Generated new mediator key (saved to {}) – public: {}",
-        path,
-        hex::encode(key.verifying_key().as_bytes())
-    );
+    info!("Generated new key (saved to {}), public: {}", path, hex::encode(key.verifying_key().as_bytes()));
     key
 }

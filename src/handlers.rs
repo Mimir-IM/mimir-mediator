@@ -42,7 +42,7 @@ pub async fn dispatch(state: &Arc<ServerState>, cc: &Arc<ClientConn>, cmd: u8, r
 // ---- Helper: lookup permissions ----
 
 async fn lookup_perms(conn: &turso::Connection, chat_id: i64, pub_key: &[u8]) -> Option<(u8, bool)> {
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let q = format!("SELECT perms_flags, banned FROM \"{}\" WHERE pubkey=?1", users_tbl);
     let mut rows = match conn.query(&q, turso::params![pub_key]).await {
         Ok(r) => r,
@@ -344,7 +344,7 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
             return;
         }
 
-        let sett = format!("settings-{}", chat_id);
+        let sett = format!("settings_{}", chat_id);
         let avatar_val: Option<&[u8]> = avatar;
         if let Err(_) = cc.db_conn.execute(
             &format!("INSERT INTO \"{}\"(name, description, avatar, perms_flags, created_at, extra) VALUES(?1,?2,?3,?4,?5,NULL)", sett),
@@ -354,7 +354,7 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
             return;
         }
 
-        let users = format!("users-{}", chat_id);
+        let users = format!("users_{}", chat_id);
         let owner_perms = (PERM_OWNER | PERM_USER) as i64;
         let empty_info: Option<&[u8]> = None;
         if let Err(_) = cc.db_conn.execute(
@@ -503,7 +503,7 @@ async fn handle_update_chat_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>,
     }
 
     // Build dynamic UPDATE
-    let sett_tbl = format!("settings-{}", chat_id);
+    let sett_tbl = format!("settings_{}", chat_id);
     let mut set_clauses = Vec::new();
     let mut args: Vec<turso::Value> = Vec::new();
     let mut param_idx = 1;
@@ -581,7 +581,7 @@ async fn handle_add_user(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id:
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let now = now_unix();
     let user_perms = PERM_USER as i64;
     let empty_info: Option<&[u8]> = None;
@@ -639,7 +639,7 @@ async fn handle_delete_user(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let now = now_unix();
     {
         let _guard = state.db.write_mu.lock().await;
@@ -713,7 +713,7 @@ async fn handle_leave_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_i
         return;
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     {
         let _guard = state.db.write_mu.lock().await;
         let _ = cc.db_conn.execute(
@@ -747,7 +747,7 @@ async fn handle_get_user_chats(_state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
     let cc_pub = *cc.pub_key.read().await;
     let mut chat_ids = Vec::new();
     for id in all_ids {
-        let users_tbl = format!("users-{}", id);
+        let users_tbl = format!("users_{}", id);
         let q = format!("SELECT banned FROM \"{}\" WHERE pubkey=?1", users_tbl);
         match cc.db_conn.query(&q, turso::params![cc_pub.as_slice()]).await {
             Ok(mut r) => {
@@ -832,7 +832,7 @@ async fn handle_change_member_status(state: &Arc<ServerState>, cc: &Arc<ClientCo
         return;
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let now = now_unix();
     let banned_val: i64 = if has_any(new_perms, PERM_BANNED) { 1 } else { 0 };
 
@@ -890,7 +890,7 @@ async fn handle_subscribe(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
         None => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let msg_tbl = format!("messages-{}", chat_id);
+    let msg_tbl = format!("messages_{}", chat_id);
     let q = format!("SELECT IFNULL(MAX(id),0) FROM \"{}\"", msg_tbl);
     let last_id: i64 = match cc.db_conn.query(&q, ()).await {
         Ok(mut r) => match r.next().await {
@@ -950,7 +950,7 @@ async fn handle_get_messages_since(cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) 
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let msg_tbl = format!("messages-{}", chat_id);
+    let msg_tbl = format!("messages_{}", chat_id);
     let q = format!("SELECT id, guid, ts, author, blob FROM \"{}\" WHERE id>?1 ORDER BY id ASC LIMIT ?2", msg_tbl);
     let mut rows = match cc.db_conn.query(&q, turso::params![since_id, limit as i64]).await {
         Ok(r) => r,
@@ -1021,7 +1021,7 @@ async fn handle_send_message(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req
         None => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let msg_tbl = format!("messages-{}", chat_id);
+    let msg_tbl = format!("messages_{}", chat_id);
     let original_guid = guid;
     let mut msg_id: i64 = 0;
     let mut success = false;
@@ -1118,7 +1118,7 @@ async fn handle_delete_message(state: &Arc<ServerState>, cc: &Arc<ClientConn>, r
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid message guid").await; return; }
     };
 
-    let msg_tbl = format!("messages-{}", chat_id);
+    let msg_tbl = format!("messages_{}", chat_id);
     let q = format!("SELECT author FROM \"{}\" WHERE guid=?1", msg_tbl);
     let author: Vec<u8> = match cc.db_conn.query(&q, turso::params![guid]).await {
         Ok(mut r) => match r.next().await {
@@ -1184,7 +1184,7 @@ async fn handle_get_last_message_id(_state: &Arc<ServerState>, cc: &Arc<ClientCo
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let msg_tbl = format!("messages-{}", chat_id);
+    let msg_tbl = format!("messages_{}", chat_id);
     let q = format!("SELECT IFNULL(MAX(id),0) FROM \"{}\"", msg_tbl);
     let last_id: i64 = match cc.db_conn.query(&q, ()).await {
         Ok(mut r) => match r.next().await {
@@ -1355,7 +1355,7 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
     }
 
     if accepted == 1 {
-        let users_tbl = format!("users-{}", chat_id);
+        let users_tbl = format!("users_{}", chat_id);
         let now = now_unix();
         let user_perms = PERM_USER as i64;
         let empty_info: Option<&[u8]> = None;
@@ -1428,7 +1428,7 @@ async fn handle_update_member_info(state: &Arc<ServerState>, cc: &Arc<ClientConn
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     {
         let _guard = state.db.write_mu.lock().await;
         if let Err(e) = cc.db_conn.execute(
@@ -1478,7 +1478,7 @@ async fn handle_get_members_info(_state: &Arc<ServerState>, cc: &Arc<ClientConn>
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let q = format!("SELECT pubkey, info, changed_at FROM \"{}\" WHERE banned = 0", users_tbl);
     let mut rows = match cc.db_conn.query(&q, ()).await {
         Ok(r) => r,
@@ -1549,7 +1549,7 @@ async fn handle_get_members(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let q = format!("SELECT pubkey, perms_flags, last_seen FROM \"{}\" WHERE banned=0", users_tbl);
     let mut rows = match cc.db_conn.query(&q, ()).await {
         Ok(r) => r,
@@ -1625,7 +1625,7 @@ pub async fn broadcast_system_message(
     let mut msg_id: i64 = 0;
 
     if store_in_db {
-        let msg_tbl = format!("messages-{}", chat_id);
+        let msg_tbl = format!("messages_{}", chat_id);
         let _guard = state.db.write_mu.lock().await;
         if let Err(e) = conn.execute(
             &format!("INSERT INTO \"{}\"(ts, guid, author, blob) VALUES(?1,?2,?3,?4)", msg_tbl),
@@ -1697,7 +1697,7 @@ pub async fn broadcast_member_online_status(state: &Arc<ServerState>, chat_id: i
 
 async fn send_invite_to_client(state: &Arc<ServerState>, cc: &Arc<ClientConn>, conn: &turso::Connection, invite_id: i64, timestamp: i64, from_pubkey: &[u8], chat_id: i64, encrypted_data: &[u8]) -> bool {
     // Get chat metadata
-    let sett_tbl = format!("settings-{}", chat_id);
+    let sett_tbl = format!("settings_{}", chat_id);
     let q = format!("SELECT name, description, avatar FROM \"{}\"", sett_tbl);
     let (chat_name, chat_desc, chat_avatar): (String, String, Option<Vec<u8>>) = match conn.query(&q, ()).await {
         Ok(mut r) => match r.next().await {
@@ -1774,7 +1774,7 @@ async fn send_pending_invites(state: &Arc<ServerState>, cc: &Arc<ClientConn>, co
 
 async fn request_member_info(cc: &Arc<ClientConn>, conn: &turso::Connection, chat_id: i64) {
     let cc_pub = *cc.pub_key.read().await;
-    let users_tbl = format!("users-{}", chat_id);
+    let users_tbl = format!("users_{}", chat_id);
     let q = format!("SELECT IFNULL(changed_at, 0) FROM \"{}\" WHERE pubkey=?1", users_tbl);
     let last_update: i64 = match conn.query(&q, turso::params![cc_pub.as_slice()]).await {
         Ok(mut r) => match r.next().await {

@@ -49,7 +49,7 @@ impl Db {
             (),
         ).await?;
 
-        // Migration: add blob column to existing message tables
+        // Migration: rename hyphenated table names to underscored
         {
             let mut rows = conn.query("SELECT id FROM chats", ()).await?;
             let mut chat_ids = Vec::new();
@@ -57,8 +57,17 @@ impl Db {
                 let id: i64 = row.get(0).unwrap_or(0);
                 chat_ids.push(id);
             }
-            for id in chat_ids {
-                let alter = format!("ALTER TABLE \"messages-{}\" ADD COLUMN blob BLOB NOT NULL DEFAULT X''", id);
+            for id in &chat_ids {
+                for prefix in &["settings", "users", "messages"] {
+                    let old_name = format!("{}-{}", prefix, id);
+                    let new_name = format!("{}_{}", prefix, id);
+                    let rename = format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old_name, new_name);
+                    let _ = conn.execute(&rename, ()).await; // ignore if already renamed
+                }
+            }
+            // Migration: add blob column to existing message tables
+            for id in &chat_ids {
+                let alter = format!("ALTER TABLE \"messages_{}\" ADD COLUMN blob BLOB NOT NULL DEFAULT X''", id);
                 let _ = conn.execute(&alter, ()).await; // ignore "duplicate column" errors
             }
         }
@@ -76,9 +85,9 @@ impl Db {
 
     /// Create the three per-chat tables. Must be called with write_mu held.
     pub async fn create_chat_tables(&self, conn: &Connection, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let settings = format!("settings-{}", id);
-        let users = format!("users-{}", id);
-        let messages = format!("messages-{}", id);
+        let settings = format!("settings_{}", id);
+        let users = format!("users_{}", id);
+        let messages = format!("messages_{}", id);
 
         conn.execute(
             &format!(
@@ -124,7 +133,7 @@ impl Db {
 
 /// Helper to get table names for a chat.
 pub fn chat_table_names(id: i64) -> (String, String, String) {
-    (format!("settings-{}", id), format!("users-{}", id), format!("messages-{}", id))
+    (format!("settings_{}", id), format!("users_{}", id), format!("messages_{}", id))
 }
 
 /// Generate a message GUID matching the Kotlin contentHashCode algorithm.
