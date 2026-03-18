@@ -230,7 +230,7 @@ pub async fn run_accept_loop(state: Arc<ServerState>, node: Arc<ygg_stream::Asyn
 
         let client_id = state.next_id();
         let remote_pub = conn.public_key();
-        info!("New client connection {} from {}", client_id, hex::encode(&remote_pub));
+        info!("Client {}: connected from {}", client_id, hex::encode(&remote_pub));
 
         let state2 = state.clone();
         tokio::spawn(async move {

@@ -3,7 +3,7 @@ use crate::server::{ClientId, ServerState};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug};
+use tracing::{debug, info};
 
 /// Per-connection state.
 pub struct ClientConn {
@@ -108,7 +108,7 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
     let db_conn = match state.db.connect() {
         Ok(c) => c,
         Err(e) => {
-            debug!("client {}: failed to create db connection: {}", client_id, e);
+            debug!("Client {}: failed to create db connection: {}", client_id, e);
             return;
         }
     };
@@ -116,21 +116,20 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
 
     // Read init bytes: [version:1][protoType:1]
     {
-        debug!("Reading version and proto");
         let mut init_buf = [0u8; 2];
         match client.read_exact(&mut init_buf).await {
             Ok(()) => {
                 if init_buf[0] != VERSION {
-                    debug!("client {}: invalid version 0x{:02X}", client_id, init_buf[0]);
+                    debug!("Client {}: invalid version 0x{:02X}", client_id, init_buf[0]);
                     return;
                 }
                 if init_buf[1] != PROTO_CLIENT {
-                    debug!("client {}: invalid proto type 0x{:02X}", client_id, init_buf[1]);
+                    debug!("Client {}: invalid proto type 0x{:02X}", client_id, init_buf[1]);
                     return;
                 }
             }
             Err(e) => {
-                debug!("client {}: failed to read init bytes: {}", client_id, e);
+                debug!("Client {}: failed to read init bytes: {}", client_id, e);
                 return;
             }
         }
@@ -142,14 +141,14 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         clients.insert(client_id, client.clone());
     }
 
-    debug!("client {}: initialized, entering command loop", client_id);
+    info!("Client {}: initialized, entering command loop", client_id);
 
     // Command loop
     loop {
         // Read frame: [cmd:1][reqId:2][len:4][payload]
         let mut hdr = [0u8; 7];
         if let Err(e) = client.read_exact(&mut hdr).await {
-            debug!("client {}: read error: {}", client_id, e);
+            debug!("Client {}: read error: {}", client_id, e);
             break;
         }
 
@@ -158,14 +157,14 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         let plen = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]);
 
         if plen > MAX_PAYLOAD {
-            debug!("client {}: payload too large", client_id);
+            debug!("Client {}: payload too large", client_id);
             break;
         }
 
         let payload = if plen > 0 {
             let mut buf = vec![0u8; plen as usize];
             if let Err(e) = client.read_exact(&mut buf).await {
-                debug!("client {}: read error: {}", client_id, e);
+                debug!("Client {}: read error: {}", client_id, e);
                 break;
             }
             buf
@@ -173,7 +172,7 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
             Vec::new()
         };
 
-        debug!("client {}: cmd=0x{:02X} reqId={} payloadLen={}", client_id, cmd, req_id, payload.len());
+        debug!("Client {}: cmd=0x{:02X} reqId={} payloadLen={}", client_id, cmd, req_id, payload.len());
         crate::handlers::dispatch(&state, &client, cmd, req_id, &payload).await;
     }
 
@@ -184,5 +183,5 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         clients.remove(&client_id);
     }
     client.conn.close().await;
-    debug!("client {}: disconnected", client_id);
+    info!("Client {}: disconnected", client_id);
 }
