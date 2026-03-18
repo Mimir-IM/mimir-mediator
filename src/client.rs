@@ -144,11 +144,12 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
     info!("Client {}: initialized, entering command loop", client_id);
 
     // Command loop
+    let disconnect_reason;
     loop {
         // Read frame: [cmd:1][reqId:2][len:4][payload]
         let mut hdr = [0u8; 7];
         if let Err(e) = client.read_exact(&mut hdr).await {
-            debug!("Client {}: read error: {}", client_id, e);
+            disconnect_reason = format!("header read error: {}", e);
             break;
         }
 
@@ -157,14 +158,14 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         let plen = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]);
 
         if plen > MAX_PAYLOAD {
-            debug!("Client {}: payload too large", client_id);
+            disconnect_reason = format!("payload too large: {} bytes", plen);
             break;
         }
 
         let payload = if plen > 0 {
             let mut buf = vec![0u8; plen as usize];
             if let Err(e) = client.read_exact(&mut buf).await {
-                debug!("Client {}: read error: {}", client_id, e);
+                disconnect_reason = format!("payload read error (cmd=0x{:02X}, len={}): {}", cmd, plen, e);
                 break;
             }
             buf
@@ -183,5 +184,5 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         clients.remove(&client_id);
     }
     client.conn.close().await;
-    info!("Client {}: disconnected", client_id);
+    info!("Client {}: disconnected, reason: {}", client_id, disconnect_reason);
 }

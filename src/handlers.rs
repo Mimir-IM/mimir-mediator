@@ -181,7 +181,7 @@ async fn handle_auth(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16
 
         // Kill old connection from same pubkey+address
         if let Some(&old_id) = addr_map.get(&addr_key) {
-            debug!("duplicate connection from {} for user {}, closing old", addr, hex::encode(&pk[..4]));
+            info!("Client {}: duplicate connection from {} for user {}, closing old client {}", cc.id, addr, hex::encode(&pk[..4]), old_id);
             if let Some(conns) = auth.get_mut(&pk) {
                 conns.remove(&old_id);
             }
