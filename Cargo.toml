@@ -1,10 +1,10 @@
 [package]
 name = "mimir-mediator"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 
 [dependencies]
-ygg_stream = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.1.8" }
+ygg_stream = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.1.9" }
 turso = "0.5.0"
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
