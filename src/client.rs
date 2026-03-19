@@ -2,7 +2,7 @@ use crate::constants::*;
 use crate::server::{ClientId, ServerState};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
 
 /// Per-connection state.
@@ -14,11 +14,16 @@ pub struct ClientConn {
     pub pub_key: RwLock<[u8; 32]>,
     pub chats: RwLock<HashSet<i64>>,
     pub addr: String,
-    write_mu: Mutex<()>,
+    write_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl ClientConn {
-    pub fn new(id: ClientId, conn: ygg_stream::AsyncConn, db_conn: turso::Connection) -> Arc<Self> {
+    pub fn new(
+        id: ClientId,
+        conn: ygg_stream::AsyncConn,
+        db_conn: turso::Connection,
+        write_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Arc<Self> {
         let addr = hex::encode(conn.public_key());
         Arc::new(Self {
             id,
@@ -28,7 +33,7 @@ impl ClientConn {
             pub_key: RwLock::new([0u8; 32]),
             chats: RwLock::new(HashSet::new()),
             addr,
-            write_mu: Mutex::new(()),
+            write_tx,
         })
     }
 
@@ -38,8 +43,6 @@ impl ClientConn {
 
     /// Write an OK response (task-safe).
     pub async fn write_ok(&self, req_id: u16, payload: &[u8]) -> Result<(), String> {
-        let _guard = self.write_mu.lock().await;
-
         let mut hdr = [0u8; 7];
         hdr[0] = STATUS_OK;
         hdr[1..3].copy_from_slice(&req_id.to_be_bytes());
@@ -49,13 +52,11 @@ impl ClientConn {
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(payload);
 
-        self.conn.write(&buf).await.map(|_| ())
+        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
     }
 
     /// Write a server-initiated push (task-safe).
     pub async fn write_push(&self, cmd: u16, payload: &[u8]) -> Result<(), String> {
-        let _guard = self.write_mu.lock().await;
-
         let mut hdr = [0u8; 7];
         hdr[0] = STATUS_PUSH;
         hdr[1..3].copy_from_slice(&cmd.to_be_bytes());
@@ -65,13 +66,12 @@ impl ClientConn {
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(payload);
 
-        self.conn.write(&buf).await.map(|_| ())
+        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
     }
 
     /// Write an error response (task-safe).
     pub async fn write_err(&self, req_id: u16, msg: &str) -> Result<(), String> {
         debug!("sending error for reqId={}: {}", req_id, msg);
-        let _guard = self.write_mu.lock().await;
 
         let msg_bytes = msg.as_bytes();
         let inner_len = 2 + msg_bytes.len();
@@ -86,7 +86,7 @@ impl ClientConn {
         buf.extend_from_slice(&(msg_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(msg_bytes);
 
-        self.conn.write(&buf).await.map(|_| ())
+        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
     }
 
     /// Async read of exactly `n` bytes. Returns Err on short read or error.
@@ -112,7 +112,22 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
             return;
         }
     };
-    let client = ClientConn::new(client_id, conn, db_conn);
+
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
+
+    // Clone conn for the writer task (reads stay on the original)
+    let writer_conn = conn.clone();
+    let writer_id = client_id;
+    tokio::spawn(async move {
+        while let Some(buf) = write_rx.recv().await {
+            if let Err(e) = writer_conn.write(&buf).await {
+                debug!("Client {}: writer error: {}", writer_id, e);
+                break;
+            }
+        }
+    });
+
+    let client = ClientConn::new(client_id, conn, db_conn, write_tx);
 
     // Read init bytes: [version:1][protoType:1]
     {
@@ -182,6 +197,6 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         let mut clients = state.clients.write().await;
         clients.remove(&client_id);
     }
-    client.conn.close().await;
+    client.conn.abort().await;
     info!("Client {}: disconnected", client_id);
 }
