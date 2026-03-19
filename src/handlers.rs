@@ -1455,7 +1455,7 @@ async fn handle_update_member_info(state: &Arc<ServerState>, cc: &Arc<ClientConn
     let _ = cc.write_ok(req_id, &[]).await;
 }
 
-async fn handle_get_members_info(_state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+async fn handle_get_members_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
     if !cc.is_authed().await {
         let _ = cc.write_err(req_id, "auth required").await;
         return;
@@ -1472,59 +1472,76 @@ async fn handle_get_members_info(_state: &Arc<ServerState>, cc: &Arc<ClientConn>
     };
     let since_ts = tlv_get_u64(&tlvs, TAG_LAST_UPDATE).unwrap_or(0);
 
+    // Permission check uses the command-loop's db_conn (fast, inline).
     let cc_pub = *cc.pub_key.read().await;
-    match lookup_perms(&cc.db_conn,chat_id, &cc_pub).await {
+    match lookup_perms(&cc.db_conn, chat_id, &cc_pub).await {
         Some((_, false)) => {}
         _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
-    let users_tbl = format!("users_{}", chat_id);
-    let q = format!("SELECT pubkey, info, changed_at FROM \"{}\" WHERE banned = 0", users_tbl);
-    let mut rows = match cc.db_conn.query(&q, ()).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to query members info for chat {}: {}", chat_id, e);
-            let _ = cc.write_err(req_id, "db error").await;
-            return;
-        }
-    };
-
-    struct MemberInfo {
-        pubkey: Vec<u8>,
-        info: Option<Vec<u8>>,
-        timestamp: i64,
-    }
-    let mut members = Vec::new();
-
-    while let Ok(Some(row)) = rows.next().await {
-        let pubkey: Vec<u8> = row.get(0).unwrap_or_default();
-        let info_bytes: Option<Vec<u8>> = row.get(1).ok();
-        let changed_at: i64 = row.get(2).unwrap_or(0);
-
-        let info = if let Some(ref ib) = info_bytes {
-            if !ib.is_empty() && (since_ts == 0 || changed_at as u64 > since_ts) {
-                Some(ib.clone())
-            } else {
-                None
+    // Spawn the heavy query so the command loop can continue processing
+    // subscribe requests without waiting for this (potentially large) response
+    // to be written through the stream's flow control.
+    let db = state.db.clone();
+    let cc2 = cc.clone();
+    tokio::spawn(async move {
+        let conn = match db.connect() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("handle_get_members_info: failed to connect: {}", e);
+                let _ = cc2.write_err(req_id, "db error").await;
+                return;
             }
-        } else {
-            None
         };
 
-        members.push(MemberInfo { pubkey, info, timestamp: changed_at });
-    }
+        let users_tbl = format!("users_{}", chat_id);
+        let q = format!("SELECT pubkey, info, changed_at FROM \"{}\" WHERE banned = 0", users_tbl);
+        let mut rows = match conn.query(&q, ()).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to query members info for chat {}: {}", chat_id, e);
+                let _ = cc2.write_err(req_id, "db error").await;
+                return;
+            }
+        };
 
-    let resp = build_tlv_payload(|w| {
-        tlv_encode_u32(w, TAG_COUNT, members.len() as u32)?;
-        for m in &members {
-            tlv_encode_bytes(w, TAG_USER_PUBKEY, &m.pubkey)?;
-            tlv_encode_bytes(w, TAG_MEMBER_INFO, m.info.as_deref().unwrap_or(&[]))?;
-            tlv_encode_u64(w, TAG_TIMESTAMP, m.timestamp as u64)?;
+        struct MemberInfo {
+            pubkey: Vec<u8>,
+            info: Option<Vec<u8>>,
+            timestamp: i64,
         }
-        Ok(())
-    }).unwrap_or_default();
+        let mut members = Vec::new();
 
-    let _ = cc.write_ok(req_id, &resp).await;
+        while let Ok(Some(row)) = rows.next().await {
+            let pubkey: Vec<u8> = row.get(0).unwrap_or_default();
+            let info_bytes: Option<Vec<u8>> = row.get(1).ok();
+            let changed_at: i64 = row.get(2).unwrap_or(0);
+
+            let info = if let Some(ref ib) = info_bytes {
+                if !ib.is_empty() && (since_ts == 0 || changed_at as u64 > since_ts) {
+                    Some(ib.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            members.push(MemberInfo { pubkey, info, timestamp: changed_at });
+        }
+
+        let resp = build_tlv_payload(|w| {
+            tlv_encode_u32(w, TAG_COUNT, members.len() as u32)?;
+            for m in &members {
+                tlv_encode_bytes(w, TAG_USER_PUBKEY, &m.pubkey)?;
+                tlv_encode_bytes(w, TAG_MEMBER_INFO, m.info.as_deref().unwrap_or(&[]))?;
+                tlv_encode_u64(w, TAG_TIMESTAMP, m.timestamp as u64)?;
+            }
+            Ok(())
+        }).unwrap_or_default();
+
+        let _ = cc2.write_ok(req_id, &resp).await;
+    });
 }
 
 async fn handle_get_members(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
