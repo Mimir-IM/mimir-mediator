@@ -191,7 +191,7 @@ async fn handle_auth(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16
             let clients = state.clients.read().await;
             if let Some(old_client) = clients.get(&old_id) {
                 let old = old_client.clone();
-                tokio::spawn(async move { old.conn.close().await; });
+                tokio::spawn(async move { old.conn.abort().await; });
             }
         }
 
