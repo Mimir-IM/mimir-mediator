@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-mediator"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ed25519-dalek",
  "getopts",
@@ -3620,8 +3620,8 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.2.0"
-source = "git+https://github.com/Revertron/ygg_stream?rev=2a145ba3#2a145ba308e11c1fbce80feb87fa54cfd42525b5"
+version = "0.2.1"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.2.1#96c5f157e666e4653cd035fc0477913668c10a34"
 dependencies = [
  "bytes",
  "ed25519-dalek",
