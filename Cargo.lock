@@ -1282,7 +1282,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironwood"
 version = "0.1.4"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=33e4056e#33e4056e54c8279043308ad61cf4032751c94f19"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=04304dda#04304dda94aeaecd52bf588b8fda25315d7be51d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3621,7 +3621,7 @@ dependencies = [
 [[package]]
 name = "ygg_stream"
 version = "0.2.0"
-source = "git+https://github.com/Revertron/ygg_stream?rev=aae7eab3#aae7eab38fe73b37a9dfd3805d987418453313fd"
+source = "git+https://github.com/Revertron/ygg_stream?rev=2a145ba3#2a145ba308e11c1fbce80feb87fa54cfd42525b5"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -3641,7 +3641,7 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.1.4"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=33e4056e#33e4056e54c8279043308ad61cf4032751c94f19"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=04304dda#04304dda94aeaecd52bf588b8fda25315d7be51d"
 dependencies = [
  "blake2",
  "ed25519-dalek",
