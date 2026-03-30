@@ -1370,6 +1370,8 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
                 let _ = cc.write_err(req_id, "db error").await;
                 return;
             }
+            // Delete invite now that user is added, before broadcast — so it's cleaned up even if broadcast fails
+            let _ = cc.db_conn.execute("DELETE FROM invites WHERE id=?1", turso::params![invite_id]).await;
         }
 
         // System message: user added
@@ -1382,13 +1384,6 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
         let now = now_unix();
         if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, None, now, true).await {
             error!("{}", e);
-            let _ = cc.write_err(req_id, "db error").await;
-            return;
-        }
-
-        {
-            let _guard = state.db.write_mu.lock().await;
-            let _ = cc.db_conn.execute("DELETE FROM invites WHERE id=?1", turso::params![invite_id]).await;
         }
     } else {
         // Rejected
