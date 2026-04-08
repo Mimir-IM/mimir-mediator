@@ -1282,7 +1282,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironwood"
 version = "0.1.4"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=04304dda#04304dda94aeaecd52bf588b8fda25315d7be51d"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=8cda4c6d#8cda4c6de407ae7abce7746b2523a3a119f5b814"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-mediator"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ed25519-dalek",
  "getopts",
@@ -3620,8 +3620,8 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.2.1"
-source = "git+https://github.com/Revertron/ygg_stream?tag=v0.2.1#96c5f157e666e4653cd035fc0477913668c10a34"
+version = "0.2.3"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.2.3#c1de1b66a444417714ccbb7c7454d2bfc9dc52f3"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -3641,18 +3641,21 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.1.4"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=04304dda#04304dda94aeaecd52bf588b8fda25315d7be51d"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=8cda4c6d#8cda4c6de407ae7abce7746b2523a3a119f5b814"
 dependencies = [
  "blake2",
  "ed25519-dalek",
+ "getifaddrs",
  "getopts",
  "hex",
  "ironwood",
  "rand 0.8.5",
  "rcgen",
+ "regex",
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "time",
  "tokio",
