@@ -157,13 +157,15 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
     }
 
     info!("Client {}: initialized, entering command loop", client_id);
+    let connected_at = std::time::Instant::now();
 
     // Command loop
+    let disconnect_reason;
     loop {
         // Read frame: [cmd:1][reqId:2][len:4][payload]
         let mut hdr = [0u8; 7];
         if let Err(e) = client.read_exact(&mut hdr).await {
-            debug!("Client {}: read error: {}", client_id, e);
+            disconnect_reason = format!("read error: {e}");
             break;
         }
 
@@ -172,14 +174,14 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         let plen = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]);
 
         if plen > MAX_PAYLOAD {
-            debug!("Client {}: payload too large", client_id);
+            disconnect_reason = format!("payload too large ({plen} bytes)");
             break;
         }
 
         let payload = if plen > 0 {
             let mut buf = vec![0u8; plen as usize];
             if let Err(e) = client.read_exact(&mut buf).await {
-                debug!("Client {}: read error: {}", client_id, e);
+                disconnect_reason = format!("payload read error: {e}");
                 break;
             }
             buf
@@ -198,5 +200,10 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         clients.remove(&client_id);
     }
     client.conn.abort().await;
-    info!("Client {}: disconnected", client_id);
+    let duration = connected_at.elapsed();
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    info!("Client {}: disconnected after {:02}:{:02}:{:02} ({})", client_id, hours, mins, secs, disconnect_reason);
 }
