@@ -105,26 +105,34 @@ impl ServerState {
             let addr = client.addr.clone();
             let addr_key = get_addr_key(&pub_key, &addr);
 
-            {
+            // Remove this client_id from auth/addr maps, then figure out
+            // whether the user still has *another* live session with the
+            // same pubkey. If so, the user is still online — don't fire
+            // the per-chat OFFLINE broadcast.
+            let still_online_elsewhere = {
                 let mut auth = self.auth_clients.write().await;
                 let mut addr_map = self.addr_conn_map.write().await;
 
-                // Remove from addr map only if it's still this connection
                 if let Some(&stored_id) = addr_map.get(&addr_key) {
                     if stored_id == client_id {
                         addr_map.remove(&addr_key);
                     }
                 }
 
+                let mut remaining_sessions = false;
                 if let Some(conns) = auth.get_mut(&pub_key) {
                     conns.remove(&client_id);
                     if conns.is_empty() {
                         auth.remove(&pub_key);
+                    } else {
+                        remaining_sessions = true;
                     }
                 }
-            }
+                remaining_sessions
+            };
 
-            // Update last_seen and broadcast offline
+            // Update last_seen for this chat in the DB regardless (it's a
+            // per-client "when did we last hear from THIS session" record).
             for &chat_id in &chats_to_notify {
                 let users_tbl = format!("users_{}", chat_id);
                 {
@@ -132,12 +140,22 @@ impl ServerState {
                     let q = format!("UPDATE \"{}\" SET last_seen=?1 WHERE pubkey=?2", users_tbl);
                     let _ = client.db_conn.execute(&q, turso::params![timestamp, pub_key.as_slice()]).await;
                 }
+            }
 
-                let state = self.clone_arc();
-                let pk = pub_key;
-                tokio::spawn(async move {
-                    crate::handlers::broadcast_member_online_status(&state, chat_id, pk, false, timestamp).await;
-                });
+            // Only broadcast OFFLINE when this was the user's last session.
+            if !still_online_elsewhere {
+                for &chat_id in &chats_to_notify {
+                    let state = self.clone_arc();
+                    let pk = pub_key;
+                    tokio::spawn(async move {
+                        crate::handlers::broadcast_member_online_status(&state, chat_id, pk, false, timestamp).await;
+                    });
+                }
+            } else {
+                tracing::info!(
+                    "disconnect of client {client_id} ({}): user still online via other session(s) — skipping OFFLINE broadcast to {} chat(s)",
+                    hex::encode(&pub_key[..4]), chats_to_notify.len(),
+                );
             }
         }
     }
