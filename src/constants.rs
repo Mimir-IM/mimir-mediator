@@ -23,6 +23,7 @@ pub const CMD_GET_MESSAGES_SINCE: u8 = 0x36;
 pub const CMD_SEND_INVITE: u8 = 0x40;
 pub const CMD_GOT_INVITE: u8 = 0x41;
 pub const CMD_INVITE_RESPONSE: u8 = 0x42;
+pub const CMD_ACK_INVITE: u8 = 0x43;
 pub const CMD_UPDATE_MEMBER_INFO: u8 = 0x50;
 pub const CMD_REQUEST_MEMBER_INFO: u8 = 0x51;
 pub const CMD_GET_MEMBERS_INFO: u8 = 0x52;

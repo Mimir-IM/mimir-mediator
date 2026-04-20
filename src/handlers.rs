@@ -29,6 +29,7 @@ pub async fn dispatch(state: &Arc<ServerState>, cc: &Arc<ClientConn>, cmd: u8, r
         CMD_GET_LAST_MESSAGE_ID => handle_get_last_message_id(state, cc, req_id, payload).await,
         CMD_SEND_INVITE => handle_send_invite(state, cc, req_id, payload).await,
         CMD_INVITE_RESPONSE => handle_invite_response(state, cc, req_id, payload).await,
+        CMD_ACK_INVITE => handle_ack_invite(state, cc, req_id, payload).await,
         CMD_UPDATE_MEMBER_INFO => handle_update_member_info(state, cc, req_id, payload).await,
         CMD_GET_MEMBERS_INFO => handle_get_members_info(state, cc, req_id, payload).await,
         CMD_GET_MEMBERS => handle_get_members(state, cc, req_id, payload).await,
@@ -1394,6 +1395,37 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
     let _ = cc.write_ok(req_id, &[]).await;
 }
 
+async fn handle_ack_invite(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+    if !cc.is_authed().await {
+        let _ = cc.write_err(req_id, "auth required").await;
+        return;
+    }
+
+    let tlvs = match parse_tlvs(p) {
+        Ok(t) => t,
+        Err(_) => { let _ = cc.write_err(req_id, "bad tlv payload").await; return; }
+    };
+
+    let invite_id = match tlv_get_i64(&tlvs, TAG_INVITE_ID) {
+        Ok(v) => v,
+        Err(_) => { let _ = cc.write_err(req_id, "missing or invalid invite id").await; return; }
+    };
+
+    let cc_pub = *cc.pub_key.read().await;
+
+    // Only the recipient of the invite may ack it. Using a WHERE clause that
+    // checks to_pubkey means a forged ack from another user is a silent no-op.
+    {
+        let _guard = state.db.write_mu.lock().await;
+        let _ = cc.db_conn.execute(
+            "UPDATE invites SET sent=1 WHERE id=?1 AND to_pubkey=?2",
+            turso::params![invite_id, cc_pub.as_slice()],
+        ).await;
+    }
+
+    let _ = cc.write_ok(req_id, &[]).await;
+}
+
 // ---- Member info handlers ----
 
 async fn handle_update_member_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
@@ -1707,7 +1739,7 @@ pub async fn broadcast_member_online_status(state: &Arc<ServerState>, chat_id: i
 
 // ---- Invite helpers ----
 
-async fn send_invite_to_client(state: &Arc<ServerState>, cc: &Arc<ClientConn>, conn: &turso::Connection, invite_id: i64, timestamp: i64, from_pubkey: &[u8], chat_id: i64, encrypted_data: &[u8]) -> bool {
+async fn send_invite_to_client(_state: &Arc<ServerState>, cc: &Arc<ClientConn>, conn: &turso::Connection, invite_id: i64, timestamp: i64, from_pubkey: &[u8], chat_id: i64, encrypted_data: &[u8]) -> bool {
     // Get chat metadata
     let sett_tbl = format!("settings_{}", chat_id);
     let q = format!("SELECT name, description, avatar FROM \"{}\"", sett_tbl);
@@ -1743,10 +1775,9 @@ async fn send_invite_to_client(state: &Arc<ServerState>, cc: &Arc<ClientConn>, c
         return false;
     }
 
-    // Mark as sent
-    let _guard = state.db.write_mu.lock().await;
-    let _ = conn.execute("UPDATE invites SET sent=1 WHERE id=?1", turso::params![invite_id]).await;
-
+    // Do NOT mark sent=1 here. Queue-write success doesn't prove the bytes
+    // reached the client. The client acks via CMD_ACK_INVITE after persisting
+    // the invite locally — handle_ack_invite is the only place that sets sent=1.
     true
 }
 
