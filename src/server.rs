@@ -27,6 +27,10 @@ pub struct ServerState {
     // Address-based dedup: "pubkey_hex:addr" -> client_id
     pub addr_conn_map: RwLock<HashMap<String, ClientId>>,
 
+    // Chat kind flags (settings_<id>.perms_flags), cached because they are
+    // consulted on every subscribe/broadcast. Chats are immutable in kind.
+    chat_flags_cache: RwLock<HashMap<i64, u8>>,
+
     // Counter for assigning client IDs
     next_client_id: std::sync::atomic::AtomicU64,
 }
@@ -45,12 +49,68 @@ impl ServerState {
             clients: RwLock::new(HashMap::new()),
             auth_clients: RwLock::new(HashMap::new()),
             addr_conn_map: RwLock::new(HashMap::new()),
+            chat_flags_cache: RwLock::new(HashMap::new()),
             next_client_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
     pub fn next_id(&self) -> ClientId {
         self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Read a chat's kind flags, going to the DB only on the first lookup.
+    /// An unknown chat reads as 0 (ordinary private group), which is also
+    /// what every chat created before channels existed stores.
+    pub async fn chat_flags(&self, conn: &turso::Connection, chat_id: i64) -> u8 {
+        if let Some(&flags) = self.chat_flags_cache.read().await.get(&chat_id) {
+            return flags;
+        }
+        let q = format!("SELECT perms_flags FROM \"settings_{}\" LIMIT 1", chat_id);
+        let flags: u8 = match conn.query(&q, ()).await {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) as u8,
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        self.chat_flags_cache.write().await.insert(chat_id, flags);
+        flags
+    }
+
+    /// True when the chat is a channel: broadcast-only, no presence, no
+    /// member list. Channels skip every per-member fanout path.
+    pub async fn is_channel(&self, conn: &turso::Connection, chat_id: i64) -> bool {
+        (self.chat_flags(conn, chat_id).await & CHAT_FLAG_CHANNEL) != 0
+    }
+
+    pub async fn set_chat_flags(&self, chat_id: i64, flags: u8) {
+        self.chat_flags_cache.write().await.insert(chat_id, flags);
+    }
+
+    pub async fn forget_chat_flags(&self, chat_id: i64) {
+        self.chat_flags_cache.write().await.remove(&chat_id);
+    }
+
+    /// Number of distinct authenticated users currently subscribed to a chat.
+    /// Deduplicated by pubkey so a multi-device user counts once.
+    pub async fn online_count(&self, chat_id: i64) -> u32 {
+        let subscriber_ids: Vec<ClientId> = {
+            let subs = self.chat_subs.read().await;
+            match subs.get(&chat_id) {
+                Some(set) => set.iter().copied().collect(),
+                None => return 0,
+            }
+        };
+        let clients = self.clients.read().await;
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for cid in subscriber_ids {
+            if let Some(client) = clients.get(&cid) {
+                if client.is_authed().await {
+                    seen.insert(*client.pub_key.read().await);
+                }
+            }
+        }
+        seen.len() as u32
     }
 
     /// Subscribe a client to a chat.
@@ -64,7 +124,13 @@ impl ServerState {
             chats.insert(chat_id);
         }
 
-        // Broadcast online status
+        // Broadcast online status. Channels have no presence: with thousands
+        // of subscribers this would be O(subscribers) pushes per connect, and
+        // every one of them lands in the message stream as a system message.
+        if self.is_channel(&client.db_conn, chat_id).await {
+            return;
+        }
+
         let pub_key = {
             let guard = client.pub_key.read().await;
             *guard
@@ -145,6 +211,9 @@ impl ServerState {
             // Only broadcast OFFLINE when this was the user's last session.
             if !still_online_elsewhere {
                 for &chat_id in &chats_to_notify {
+                    if self.is_channel(&client.db_conn, chat_id).await {
+                        continue;
+                    }
                     let state = self.clone_arc();
                     let pk = pub_key;
                     tokio::spawn(async move {
@@ -162,31 +231,20 @@ impl ServerState {
 
     /// Broadcast a message payload to all subscribers of a chat except sender.
     pub async fn broadcast_message(&self, chat_id: i64, sender_id: Option<ClientId>, payload: Vec<u8>) {
-        let subscriber_ids: Vec<ClientId> = {
-            let subs = self.chat_subs.read().await;
-            match subs.get(&chat_id) {
-                Some(set) => set.iter().copied().collect(),
-                None => return,
-            }
-        };
-
-        let clients = self.clients.read().await;
-        for cid in subscriber_ids {
-            if Some(cid) == sender_id {
-                continue;
-            }
-            if let Some(client) = clients.get(&cid) {
-                let c = client.clone();
-                let p = payload.clone();
-                tokio::spawn(async move {
-                    let _ = c.write_push(CMD_GOT_MESSAGE as u16, &p).await;
-                });
-            }
-        }
+        self.fanout(chat_id, sender_id, CMD_GOT_MESSAGE as u16, payload).await;
     }
 
     /// Broadcast with a custom command to all chat subscribers except sender.
     pub async fn broadcast_to_chat(&self, chat_id: i64, sender_id: Option<ClientId>, cmd: u16, payload: Vec<u8>) {
+        self.fanout(chat_id, sender_id, cmd, payload).await;
+    }
+
+    /// Push one frame to every subscriber of a chat except the sender.
+    ///
+    /// The frame is byte-identical for all of them, so it is built once and
+    /// shared by `Arc`. A channel post to thousands of subscribers therefore
+    /// costs one copy of the payload, not one per subscriber.
+    async fn fanout(&self, chat_id: i64, sender_id: Option<ClientId>, cmd: u16, payload: Vec<u8>) {
         let subscriber_ids: Vec<ClientId> = {
             let subs = self.chat_subs.read().await;
             match subs.get(&chat_id) {
@@ -195,6 +253,9 @@ impl ServerState {
             }
         };
 
+        let frame = crate::client::build_push_frame(cmd, &payload);
+        drop(payload);
+
         let clients = self.clients.read().await;
         for cid in subscriber_ids {
             if Some(cid) == sender_id {
@@ -202,9 +263,9 @@ impl ServerState {
             }
             if let Some(client) = clients.get(&cid) {
                 let c = client.clone();
-                let p = payload.clone();
+                let f = frame.clone();
                 tokio::spawn(async move {
-                    let _ = c.write_push(cmd, &p).await;
+                    let _ = c.send_frame(f).await;
                 });
             }
         }

@@ -18,12 +18,15 @@ pub async fn dispatch(state: &Arc<ServerState>, cc: &Arc<ClientConn>, cmd: u8, r
         CMD_CREATE_CHAT => handle_create_chat(state, cc, req_id, payload).await,
         CMD_DELETE_CHAT => handle_delete_chat(state, cc, req_id, payload).await,
         CMD_UPDATE_CHAT_INFO => handle_update_chat_info(state, cc, req_id, payload).await,
+        CMD_GET_CHAT_INFO => handle_get_chat_info(state, cc, req_id, payload).await,
         CMD_ADD_USER => handle_add_user(state, cc, req_id, payload).await,
         CMD_DELETE_USER => handle_delete_user(state, cc, req_id, payload).await,
         CMD_GET_USER_CHATS => handle_get_user_chats(state, cc, req_id, payload).await,
+        CMD_JOIN_CHAT => handle_join_chat(state, cc, req_id, payload).await,
         CMD_LEAVE_CHAT => handle_leave_chat(state, cc, req_id, payload).await,
         CMD_SUBSCRIBE => handle_subscribe(state, cc, req_id, payload).await,
         CMD_GET_MESSAGES_SINCE => handle_get_messages_since(cc, req_id, payload).await,
+        CMD_GET_CHAT_STATS => handle_get_chat_stats(state, cc, req_id, payload).await,
         CMD_SEND_MESSAGE => handle_send_message(state, cc, req_id, payload).await,
         CMD_DELETE_MESSAGE => handle_delete_message(state, cc, req_id, payload).await,
         CMD_GET_LAST_MESSAGE_ID => handle_get_last_message_id(state, cc, req_id, payload).await,
@@ -262,6 +265,18 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
     };
     let avatar = tlv_get_bytes_optional(&tlvs, TAG_CHAT_AVATAR);
 
+    // Chat kind. Absent means 0 — an ordinary private group, which is what
+    // every client built before channels existed sends.
+    let chat_flags = tlv_get_u8(&tlvs, TAG_PERMS).unwrap_or(0);
+    if chat_flags & !(CHAT_FLAG_CHANNEL | CHAT_FLAG_PUBLIC) != 0 {
+        let _ = cc.write_err(req_id, "unknown chat flags").await;
+        return;
+    }
+    if chat_flags & CHAT_FLAG_PUBLIC != 0 && chat_flags & CHAT_FLAG_CHANNEL == 0 {
+        let _ = cc.write_err(req_id, "only channels can be public").await;
+        return;
+    }
+
     // Validate lengths (character count, not bytes)
     if name.chars().count() > MAX_NAME_LEN || desc.chars().count() > MAX_DESC_LEN {
         let _ = cc.write_err(req_id, "field too large").await;
@@ -349,7 +364,7 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         let avatar_val: Option<&[u8]> = avatar;
         if let Err(_) = cc.db_conn.execute(
             &format!("INSERT INTO \"{}\"(name, description, avatar, perms_flags, created_at, extra) VALUES(?1,?2,?3,?4,?5,NULL)", sett),
-            turso::params![name.as_str(), desc.as_str(), avatar_val, 0i64, now],
+            turso::params![name.as_str(), desc.as_str(), avatar_val, chat_flags as i64, now],
         ).await {
             let _ = cc.write_err(req_id, "db settings").await;
             return;
@@ -366,6 +381,8 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
             return;
         }
     }
+
+    state.set_chat_flags(chat_id, chat_flags).await;
 
     let resp = match build_tlv_payload(|w| tlv_encode_i64(w, TAG_CHAT_ID, chat_id)) {
         Ok(r) => r,
@@ -411,6 +428,7 @@ async fn handle_delete_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         let _ = cc.db_conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", msgs), ()).await;
         let _ = cc.db_conn.execute("DELETE FROM chats WHERE id=?1", turso::params![chat_id]).await;
     }
+    state.forget_chat_flags(chat_id).await;
 
     // Broadcast system message: chat deleted
     let ts = now_unix();
@@ -584,7 +602,9 @@ async fn handle_add_user(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id:
 
     let users_tbl = format!("users_{}", chat_id);
     let now = now_unix();
-    let user_perms = PERM_USER as i64;
+    let is_channel = state.is_channel(&cc.db_conn, chat_id).await;
+    // A channel member is a subscriber: read-only unless promoted later.
+    let user_perms = if is_channel { PERM_READ_ONLY } else { PERM_USER } as i64;
     let empty_info: Option<&[u8]> = None;
 
     {
@@ -598,17 +618,19 @@ async fn handle_add_user(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id:
         }
     }
 
-    // System message: user added
-    let mut body = vec![0u8; 1 + 32 + 32 + 32];
-    body[0] = SYS_USER_ADDED;
-    body[1..33].copy_from_slice(&new_user);
-    body[33..65].copy_from_slice(&cc_pub);
-    body[65..97].copy_from_slice(&rand32());
+    // System message: user added. Channels announce no membership changes.
+    if !is_channel {
+        let mut body = vec![0u8; 1 + 32 + 32 + 32];
+        body[0] = SYS_USER_ADDED;
+        body[1..33].copy_from_slice(&new_user);
+        body[33..65].copy_from_slice(&cc_pub);
+        body[65..97].copy_from_slice(&rand32());
 
-    if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
-        error!("{}", e);
-        let _ = cc.write_err(req_id, "db error").await;
-        return;
+        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
+            error!("{}", e);
+            let _ = cc.write_err(req_id, "db error").await;
+            return;
+        }
     }
 
     let _ = cc.write_ok(req_id, &[]).await;
@@ -650,16 +672,18 @@ async fn handle_delete_user(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         ).await;
     }
 
-    let mut body = vec![0u8; 1 + 32 + 32 + 32];
-    body[0] = SYS_USER_BANNED;
-    body[1..33].copy_from_slice(&user_pk);
-    body[33..65].copy_from_slice(&cc_pub);
-    body[65..97].copy_from_slice(&rand32());
+    if !state.is_channel(&cc.db_conn, chat_id).await {
+        let mut body = vec![0u8; 1 + 32 + 32 + 32];
+        body[0] = SYS_USER_BANNED;
+        body[1..33].copy_from_slice(&user_pk);
+        body[33..65].copy_from_slice(&cc_pub);
+        body[65..97].copy_from_slice(&rand32());
 
-    if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
-        error!("{}", e);
-        let _ = cc.write_err(req_id, "db error deleting user").await;
-        return;
+        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
+            error!("{}", e);
+            let _ = cc.write_err(req_id, "db error deleting user").await;
+            return;
+        }
     }
 
     let _ = cc.write_ok(req_id, &[]).await;
@@ -702,16 +726,18 @@ async fn handle_leave_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_i
     }
     { cc.chats.write().await.remove(&chat_id); }
 
-    let mut body = vec![0u8; 1 + 32 + 32];
-    body[0] = SYS_USER_LEFT;
-    body[1..33].copy_from_slice(&cc_pub);
-    body[33..65].copy_from_slice(&rand32());
+    if !state.is_channel(&cc.db_conn, chat_id).await {
+        let mut body = vec![0u8; 1 + 32 + 32];
+        body[0] = SYS_USER_LEFT;
+        body[1..33].copy_from_slice(&cc_pub);
+        body[33..65].copy_from_slice(&rand32());
 
-    let now = now_unix();
-    if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
-        error!("{}", e);
-        let _ = cc.write_err(req_id, "db error").await;
-        return;
+        let now = now_unix();
+        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
+            error!("{}", e);
+            let _ = cc.write_err(req_id, "db error").await;
+            return;
+        }
     }
 
     let users_tbl = format!("users_{}", chat_id);
@@ -849,17 +875,19 @@ async fn handle_change_member_status(state: &Arc<ServerState>, cc: &Arc<ClientCo
         }
     }
 
-    let mut body = vec![0u8; 1 + 32 + 1 + 32 + 32];
-    body[0] = SYS_PERMS_CHANGED;
-    body[1..33].copy_from_slice(&target_pk);
-    body[33] = new_perms;
-    body[34..66].copy_from_slice(&cc_pub);
-    body[66..98].copy_from_slice(&rand32());
+    if !state.is_channel(&cc.db_conn, chat_id).await {
+        let mut body = vec![0u8; 1 + 32 + 1 + 32 + 32];
+        body[0] = SYS_PERMS_CHANGED;
+        body[1..33].copy_from_slice(&target_pk);
+        body[33] = new_perms;
+        body[34..66].copy_from_slice(&cc_pub);
+        body[66..98].copy_from_slice(&rand32());
 
-    if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
-        error!("broadcasting permission change: {}", e);
-        let _ = cc.write_err(req_id, "broadcast error").await;
-        return;
+        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, Some(cc.id), now, true).await {
+            error!("broadcasting permission change: {}", e);
+            let _ = cc.write_err(req_id, "broadcast error").await;
+            return;
+        }
     }
 
     let _ = cc.write_ok(req_id, &[]).await;
@@ -883,12 +911,13 @@ async fn handle_subscribe(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
     };
 
+    // Any non-banned member may listen, read-only ones included -- that is the
+    // whole point of a channel subscriber, and read-only members of ordinary
+    // groups were wrongly cut off from live pushes before.
     let cc_pub = *cc.pub_key.read().await;
     match lookup_perms(&cc.db_conn,chat_id, &cc_pub).await {
-        Some((role, false)) if !has_any(role, PERM_READ_ONLY) => {}
-        Some((_, true)) => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
-        Some(_) => { let _ = cc.write_err(req_id, "read-only user").await; return; }
-        None => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
+        Some((_, false)) => {}
+        _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
     }
 
     let msg_tbl = format!("messages_{}", chat_id);
@@ -903,10 +932,22 @@ async fn handle_subscribe(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
 
     state.subscribe(chat_id, cc.id, cc).await;
 
-    let resp = build_tlv_payload(|w| tlv_encode_u64(w, TAG_MESSAGE_ID, last_id as u64)).unwrap_or_default();
+    // Subscriber/online counts ride along so opening a channel needs no
+    // extra round-trip. Groups get them too; they are cheap and harmless.
+    let subscribers = count_members(&cc.db_conn, chat_id).await;
+    let online = state.online_count(chat_id).await;
+
+    let resp = build_tlv_payload(|w| {
+        tlv_encode_u64(w, TAG_MESSAGE_ID, last_id as u64)?;
+        tlv_encode_u32(w, TAG_COUNT, subscribers)?;
+        tlv_encode_u32(w, TAG_ONLINE, online)
+    }).unwrap_or_default();
     let _ = cc.write_ok(req_id, &resp).await;
 
-    // Request member info
+    // Request member info. Channels have no member info at all.
+    if state.is_channel(&cc.db_conn, chat_id).await {
+        return;
+    }
     let state2 = state.clone();
     let cc2 = cc.clone();
     tokio::spawn(async move {
@@ -915,6 +956,181 @@ async fn handle_subscribe(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
             Err(e) => warn!("request_member_info: failed to connect: {}", e),
         }
     });
+}
+
+/// Count non-banned members of a chat.
+async fn count_members(conn: &turso::Connection, chat_id: i64) -> u32 {
+    let q = format!("SELECT COUNT(*) FROM \"users_{}\" WHERE banned=0", chat_id);
+    match conn.query(&q, ()).await {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0).max(0) as u32,
+            _ => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// Subscriber and online counts for a chat. This is the only member-related
+/// information a channel ever discloses: the subscriber list itself is never
+/// served to anyone, the owner included.
+async fn handle_get_chat_stats(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+    if !cc.is_authed().await {
+        let _ = cc.write_err(req_id, "auth required").await;
+        return;
+    }
+
+    let tlvs = match parse_tlvs(p) {
+        Ok(t) => t,
+        Err(_) => { let _ = cc.write_err(req_id, "bad tlv payload").await; return; }
+    };
+
+    let chat_id = match tlv_get_i64(&tlvs, TAG_CHAT_ID) {
+        Ok(v) => v,
+        Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
+    };
+
+    let cc_pub = *cc.pub_key.read().await;
+    match lookup_perms(&cc.db_conn, chat_id, &cc_pub).await {
+        Some((_, false)) => {}
+        _ => { let _ = cc.write_err(req_id, "not a member or banned").await; return; }
+    }
+
+    let subscribers = count_members(&cc.db_conn, chat_id).await;
+    let online = state.online_count(chat_id).await;
+
+    let resp = build_tlv_payload(|w| {
+        tlv_encode_i64(w, TAG_CHAT_ID, chat_id)?;
+        tlv_encode_u32(w, TAG_COUNT, subscribers)?;
+        tlv_encode_u32(w, TAG_ONLINE, online)
+    }).unwrap_or_default();
+    let _ = cc.write_ok(req_id, &resp).await;
+}
+
+/// Self-service join, for public channels only. Private channels and groups
+/// keep going through an owner-issued invite; the shared key travels in the
+/// invite link fragment, never through the mediator.
+async fn handle_join_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+    if !cc.is_authed().await {
+        let _ = cc.write_err(req_id, "auth required").await;
+        return;
+    }
+
+    let tlvs = match parse_tlvs(p) {
+        Ok(t) => t,
+        Err(_) => { let _ = cc.write_err(req_id, "bad tlv payload").await; return; }
+    };
+
+    let chat_id = match tlv_get_i64(&tlvs, TAG_CHAT_ID) {
+        Ok(v) => v,
+        Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
+    };
+
+    let flags = state.chat_flags(&cc.db_conn, chat_id).await;
+    if flags & CHAT_FLAG_PUBLIC == 0 {
+        let _ = cc.write_err(req_id, "chat is not public").await;
+        return;
+    }
+
+    let cc_pub = *cc.pub_key.read().await;
+    match lookup_perms(&cc.db_conn, chat_id, &cc_pub).await {
+        Some((_, true)) => { let _ = cc.write_err(req_id, "banned").await; return; }
+        // Already a member: fall through and answer as if the join succeeded,
+        // so re-opening a link is idempotent.
+        Some((_, false)) => {}
+        None => {
+            if count_members(&cc.db_conn, chat_id).await as i64 >= MAX_CHANNEL_SUBSCRIBERS {
+                let _ = cc.write_err(req_id, "channel is full").await;
+                return;
+            }
+            let now = now_unix();
+            let empty_info: Option<&[u8]> = None;
+            let _guard = state.db.write_mu.lock().await;
+            if let Err(e) = cc.db_conn.execute(
+                &format!("INSERT INTO \"users_{}\"(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info) VALUES(?1,?2,?3,?4,?5,0,?6) ON CONFLICT(pubkey) DO NOTHING", chat_id),
+                turso::params![cc_pub.as_slice(), "", PERM_READ_ONLY as i64, now, now, empty_info],
+            ).await {
+                error!("join chat {}: {}", chat_id, e);
+                let _ = cc.write_err(req_id, "db error").await;
+                return;
+            }
+        }
+    }
+
+    // Deliberately no SYS_USER_ADDED: subscribers are not announced, and at
+    // channel scale a join notice is a stored message plus a push to everyone.
+
+    match build_chat_info_payload(&cc.db_conn, chat_id, flags).await {
+        Some(resp) => { let _ = cc.write_ok(req_id, &resp).await; }
+        None => { let _ = cc.write_err(req_id, "no such chat").await; }
+    }
+}
+
+/// Public description of a chat: name, description, avatar, owner, kind and
+/// subscriber count. Shared by `CMD_JOIN_CHAT` and `CMD_GET_CHAT_INFO`.
+async fn build_chat_info_payload(conn: &turso::Connection, chat_id: i64, flags: u8) -> Option<Vec<u8>> {
+    let q = format!("SELECT name, description, avatar FROM \"settings_{}\"", chat_id);
+    let (name, desc, avatar): (String, String, Vec<u8>) = match conn.query(&q, ()).await {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(row)) => (
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+                row.get::<Vec<u8>>(2).unwrap_or_default(),
+            ),
+            _ => return None,
+        },
+        Err(_) => return None,
+    };
+
+    let owner: Vec<u8> = match conn.query("SELECT owner_pubkey FROM chats WHERE id=?1", turso::params![chat_id]).await {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(row)) => row.get::<Vec<u8>>(0).unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+
+    let subscribers = count_members(conn, chat_id).await;
+    build_tlv_payload(|w| {
+        tlv_encode_i64(w, TAG_CHAT_ID, chat_id)?;
+        tlv_encode_string(w, TAG_CHAT_NAME, &name)?;
+        tlv_encode_string(w, TAG_CHAT_DESC, &desc)?;
+        tlv_encode_bytes(w, TAG_CHAT_AVATAR, &avatar)?;
+        tlv_encode_bytes(w, TAG_PUBKEY, &owner)?;
+        tlv_encode_u8(w, TAG_PERMS, flags)?;
+        tlv_encode_u32(w, TAG_COUNT, subscribers)
+    }).ok()
+}
+
+/// Look at a public channel without joining it, so a client following an
+/// invite link can show what it is before asking the user to commit.
+/// Public channels only: anything else would leak a private chat's name to
+/// anyone who guessed its id.
+async fn handle_get_chat_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
+    if !cc.is_authed().await {
+        let _ = cc.write_err(req_id, "auth required").await;
+        return;
+    }
+
+    let tlvs = match parse_tlvs(p) {
+        Ok(t) => t,
+        Err(_) => { let _ = cc.write_err(req_id, "bad tlv payload").await; return; }
+    };
+
+    let chat_id = match tlv_get_i64(&tlvs, TAG_CHAT_ID) {
+        Ok(v) => v,
+        Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
+    };
+
+    let flags = state.chat_flags(&cc.db_conn, chat_id).await;
+    if flags & CHAT_FLAG_PUBLIC == 0 {
+        let _ = cc.write_err(req_id, "chat is not public").await;
+        return;
+    }
+
+    match build_chat_info_payload(&cc.db_conn, chat_id, flags).await {
+        Some(resp) => { let _ = cc.write_ok(req_id, &resp).await; }
+        None => { let _ = cc.write_err(req_id, "no such chat").await; }
+    }
 }
 
 async fn handle_get_messages_since(cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
@@ -1358,7 +1574,8 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
     if accepted == 1 {
         let users_tbl = format!("users_{}", chat_id);
         let now = now_unix();
-        let user_perms = PERM_USER as i64;
+        let is_channel = state.is_channel(&cc.db_conn, chat_id).await;
+        let user_perms = if is_channel { PERM_READ_ONLY } else { PERM_USER } as i64;
         let empty_info: Option<&[u8]> = None;
 
         {
@@ -1375,16 +1592,18 @@ async fn handle_invite_response(state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
             let _ = cc.db_conn.execute("DELETE FROM invites WHERE id=?1", turso::params![invite_id]).await;
         }
 
-        // System message: user added
-        let mut body = vec![0u8; 1 + 32 + 32 + 32];
-        body[0] = SYS_USER_ADDED;
-        body[1..33].copy_from_slice(&cc_pub);
-        body[33..65].copy_from_slice(&from_pubkey);
-        body[65..97].copy_from_slice(&rand32());
+        // System message: user added. Channels announce no membership changes.
+        if !is_channel {
+            let mut body = vec![0u8; 1 + 32 + 32 + 32];
+            body[0] = SYS_USER_ADDED;
+            body[1..33].copy_from_slice(&cc_pub);
+            body[33..65].copy_from_slice(&from_pubkey);
+            body[65..97].copy_from_slice(&rand32());
 
-        let now = now_unix();
-        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, None, now, true).await {
-            error!("{}", e);
+            let now = now_unix();
+            if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, None, now, true).await {
+                error!("{}", e);
+            }
         }
     } else {
         // Rejected
@@ -1468,16 +1687,19 @@ async fn handle_update_member_info(state: &Arc<ServerState>, cc: &Arc<ClientConn
         }
     }
 
-    // Broadcast member info update
-    let broadcast_payload = build_tlv_payload(|w| {
-        tlv_encode_i64(w, TAG_CHAT_ID, chat_id)?;
-        tlv_encode_u32(w, TAG_COUNT, 1)?;
-        tlv_encode_bytes(w, TAG_USER_PUBKEY, &cc_pub)?;
-        tlv_encode_bytes(w, TAG_MEMBER_INFO, &encrypted_blob)?;
-        tlv_encode_u64(w, TAG_TIMESTAMP, timestamp)
-    }).unwrap_or_default();
+    // Broadcast member info update. Never in a channel: that is one push per
+    // subscriber for a nickname nobody is shown.
+    if !state.is_channel(&cc.db_conn, chat_id).await {
+        let broadcast_payload = build_tlv_payload(|w| {
+            tlv_encode_i64(w, TAG_CHAT_ID, chat_id)?;
+            tlv_encode_u32(w, TAG_COUNT, 1)?;
+            tlv_encode_bytes(w, TAG_USER_PUBKEY, &cc_pub)?;
+            tlv_encode_bytes(w, TAG_MEMBER_INFO, &encrypted_blob)?;
+            tlv_encode_u64(w, TAG_TIMESTAMP, timestamp)
+        }).unwrap_or_default();
 
-    state.broadcast_to_chat(chat_id, None, CMD_GOT_MEMBER_INFO as u16, broadcast_payload).await;
+        state.broadcast_to_chat(chat_id, None, CMD_GOT_MEMBER_INFO as u16, broadcast_payload).await;
+    }
 
     let _ = cc.write_ok(req_id, &[]).await;
 }
@@ -1497,6 +1719,13 @@ async fn handle_get_members_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>,
         Ok(v) => v,
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
     };
+    // A channel never discloses who is subscribed to it. Counts only, via
+    // CMD_GET_CHAT_STATS.
+    if state.is_channel(&cc.db_conn, chat_id).await {
+        let _ = cc.write_err(req_id, "channels have no member list").await;
+        return;
+    }
+
     let since_ts = tlv_get_u64(&tlvs, TAG_LAST_UPDATE).unwrap_or(0);
 
     // Permission check uses the command-loop's db_conn (fast, inline).
@@ -1586,6 +1815,13 @@ async fn handle_get_members(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         Ok(v) => v,
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid chat id").await; return; }
     };
+
+    // A channel never discloses who is subscribed to it. Counts only, via
+    // CMD_GET_CHAT_STATS.
+    if state.is_channel(&cc.db_conn, chat_id).await {
+        let _ = cc.write_err(req_id, "channels have no member list").await;
+        return;
+    }
 
     let cc_pub = *cc.pub_key.read().await;
     match lookup_perms(&cc.db_conn,chat_id, &cc_pub).await {
@@ -1742,13 +1978,14 @@ pub async fn broadcast_member_online_status(state: &Arc<ServerState>, chat_id: i
 async fn send_invite_to_client(_state: &Arc<ServerState>, cc: &Arc<ClientConn>, conn: &turso::Connection, invite_id: i64, timestamp: i64, from_pubkey: &[u8], chat_id: i64, encrypted_data: &[u8]) -> bool {
     // Get chat metadata
     let sett_tbl = format!("settings_{}", chat_id);
-    let q = format!("SELECT name, description, avatar FROM \"{}\"", sett_tbl);
-    let (chat_name, chat_desc, chat_avatar): (String, String, Option<Vec<u8>>) = match conn.query(&q, ()).await {
+    let q = format!("SELECT name, description, avatar, perms_flags FROM \"{}\"", sett_tbl);
+    let (chat_name, chat_desc, chat_avatar, chat_flags): (String, String, Option<Vec<u8>>, u8) = match conn.query(&q, ()).await {
         Ok(mut r) => match r.next().await {
             Ok(Some(row)) => (
                 row.get(0).unwrap_or_default(),
                 row.get(1).unwrap_or_default(),
                 row.get(2).ok(),
+                row.get::<i64>(3).unwrap_or(0) as u8,
             ),
             _ => { warn!("Failed to get chat metadata for {}", chat_id); return false; }
         },
@@ -1765,6 +2002,9 @@ async fn send_invite_to_client(_state: &Arc<ServerState>, cc: &Arc<ClientConn>, 
         if let Some(ref av) = chat_avatar {
             tlv_encode_bytes(w, TAG_CHAT_AVATAR, av)?;
         }
+        // The chat kind: an invitee has no other way to learn that what they
+        // were invited to is a channel rather than a group.
+        tlv_encode_u8(w, TAG_PERMS, chat_flags)?;
         tlv_encode_bytes(w, TAG_INVITE_DATA, encrypted_data)
     }) {
         Ok(p) => p,

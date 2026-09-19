@@ -10,16 +10,19 @@ pub const CMD_PING: u8 = 0x03;
 pub const CMD_CREATE_CHAT: u8 = 0x10;
 pub const CMD_DELETE_CHAT: u8 = 0x11;
 pub const CMD_UPDATE_CHAT_INFO: u8 = 0x12;
+pub const CMD_GET_CHAT_INFO: u8 = 0x13;
 pub const CMD_ADD_USER: u8 = 0x20;
 pub const CMD_DELETE_USER: u8 = 0x21;
 pub const CMD_LEAVE_CHAT: u8 = 0x22;
 pub const CMD_GET_USER_CHATS: u8 = 0x23;
+pub const CMD_JOIN_CHAT: u8 = 0x24;
 pub const CMD_SEND_MESSAGE: u8 = 0x30;
 pub const CMD_DELETE_MESSAGE: u8 = 0x31;
 pub const CMD_GOT_MESSAGE: u8 = 0x32;
 pub const CMD_GET_LAST_MESSAGE_ID: u8 = 0x33;
 pub const CMD_SUBSCRIBE: u8 = 0x35;
 pub const CMD_GET_MESSAGES_SINCE: u8 = 0x36;
+pub const CMD_GET_CHAT_STATS: u8 = 0x37;
 pub const CMD_SEND_INVITE: u8 = 0x40;
 pub const CMD_GOT_INVITE: u8 = 0x41;
 pub const CMD_INVITE_RESPONSE: u8 = 0x42;
@@ -30,6 +33,12 @@ pub const CMD_GET_MEMBERS_INFO: u8 = 0x52;
 pub const CMD_GET_MEMBERS: u8 = 0x53;
 pub const CMD_GOT_MEMBER_INFO: u8 = 0x54;
 pub const CMD_CHANGE_MEMBER_STATUS: u8 = 0x55;
+
+// Chat kind flags, stored in `settings_<id>.perms_flags`.
+// 0 = ordinary private group, which is what every chat created before
+// channels existed has (the column was always written as a literal 0).
+pub const CHAT_FLAG_CHANNEL: u8 = 0x01;
+pub const CHAT_FLAG_PUBLIC: u8 = 0x02;
 
 // Response status
 pub const STATUS_OK: u8 = 0x00;
@@ -50,6 +59,8 @@ pub const SYS_MEMBER_ONLINE: u8 = 0x09;
 pub const MAX_NAME_LEN: usize = 25;
 pub const MAX_DESC_LEN: usize = 200;
 pub const MAX_AVATAR_BYTES: usize = 200 * 1024;
+/// Cap on how many members a channel may accumulate.
+pub const MAX_CHANNEL_SUBSCRIBERS: i64 = 100_000;
 pub const MAX_PAYLOAD: u32 = 51 * 1024 * 1024; // 50 MB + meta-data
 
 // File names

@@ -14,7 +14,7 @@ pub struct ClientConn {
     pub pub_key: RwLock<[u8; 32]>,
     pub chats: RwLock<HashSet<i64>>,
     pub addr: String,
-    write_tx: mpsc::Sender<Vec<u8>>,
+    write_tx: mpsc::Sender<Arc<Vec<u8>>>,
 }
 
 impl ClientConn {
@@ -22,7 +22,7 @@ impl ClientConn {
         id: ClientId,
         conn: ygg_stream::AsyncConn,
         db_conn: turso::Connection,
-        write_tx: mpsc::Sender<Vec<u8>>,
+        write_tx: mpsc::Sender<Arc<Vec<u8>>>,
     ) -> Arc<Self> {
         let addr = hex::encode(conn.public_key());
         Arc::new(Self {
@@ -52,21 +52,19 @@ impl ClientConn {
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(payload);
 
-        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
+        self.send_frame(Arc::new(buf)).await
     }
 
     /// Write a server-initiated push (task-safe).
     pub async fn write_push(&self, cmd: u16, payload: &[u8]) -> Result<(), String> {
-        let mut hdr = [0u8; 7];
-        hdr[0] = STATUS_PUSH;
-        hdr[1..3].copy_from_slice(&cmd.to_be_bytes());
-        hdr[3..7].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        self.send_frame(build_push_frame(cmd, payload)).await
+    }
 
-        let mut buf = Vec::with_capacity(7 + payload.len());
-        buf.extend_from_slice(&hdr);
-        buf.extend_from_slice(payload);
-
-        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
+    /// Queue an already-framed message. A push frame is byte-identical for
+    /// every recipient, so a broadcast builds it once and hands every client
+    /// a clone of the same `Arc` instead of a copy per subscriber.
+    pub async fn send_frame(&self, frame: Arc<Vec<u8>>) -> Result<(), String> {
+        self.write_tx.send(frame).await.map_err(|_| "write channel closed".to_string())
     }
 
     /// Write an error response (task-safe).
@@ -86,7 +84,7 @@ impl ClientConn {
         buf.extend_from_slice(&(msg_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(msg_bytes);
 
-        self.write_tx.send(buf).await.map_err(|_| "write channel closed".to_string())
+        self.send_frame(Arc::new(buf)).await
     }
 
     /// Async read of exactly `n` bytes. Returns Err on short read or error.
@@ -103,6 +101,16 @@ impl ClientConn {
     }
 }
 
+/// Build a push frame: `[STATUS_PUSH][cmd:2][len:4][payload]`.
+pub fn build_push_frame(cmd: u16, payload: &[u8]) -> Arc<Vec<u8>> {
+    let mut buf = Vec::with_capacity(7 + payload.len());
+    buf.push(STATUS_PUSH);
+    buf.extend_from_slice(&cmd.to_be_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    Arc::new(buf)
+}
+
 /// Serve a single client connection.
 pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, client_id: ClientId) {
     let db_conn = match state.db.connect() {
@@ -113,7 +121,7 @@ pub async fn serve_client(state: Arc<ServerState>, conn: ygg_stream::AsyncConn, 
         }
     };
 
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (write_tx, mut write_rx) = mpsc::channel::<Arc<Vec<u8>>>(256);
 
     // Clone conn for the writer task (reads stay on the original)
     let writer_conn = conn.clone();
