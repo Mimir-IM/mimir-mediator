@@ -272,10 +272,6 @@ async fn handle_create_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_
         let _ = cc.write_err(req_id, "unknown chat flags").await;
         return;
     }
-    if chat_flags & CHAT_FLAG_PUBLIC != 0 && chat_flags & CHAT_FLAG_CHANNEL == 0 {
-        let _ = cc.write_err(req_id, "only channels can be public").await;
-        return;
-    }
 
     // Validate lengths (character count, not bytes)
     if name.chars().count() > MAX_NAME_LEN || desc.chars().count() > MAX_DESC_LEN {
@@ -1006,9 +1002,10 @@ async fn handle_get_chat_stats(state: &Arc<ServerState>, cc: &Arc<ClientConn>, r
     let _ = cc.write_ok(req_id, &resp).await;
 }
 
-/// Self-service join, for public channels only. Private channels and groups
-/// keep going through an owner-issued invite; the shared key travels in the
-/// invite link fragment, never through the mediator.
+/// Self-service join, for public chats only — a public channel or a public
+/// group. Private ones keep going through an owner-issued invite; either way
+/// the shared key travels in the invite link fragment, never through the
+/// mediator.
 async fn handle_join_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
     if !cc.is_authed().await {
         let _ = cc.write_err(req_id, "auth required").await;
@@ -1031,7 +1028,13 @@ async fn handle_join_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
         return;
     }
 
+    // A channel's joiner is a subscriber and may not post; a group's joiner is
+    // an ordinary member, exactly as if the owner had invited them.
+    let is_channel = flags & CHAT_FLAG_CHANNEL != 0;
+    let user_perms = if is_channel { PERM_READ_ONLY } else { PERM_USER } as i64;
+
     let cc_pub = *cc.pub_key.read().await;
+    let mut joined_now = false;
     match lookup_perms(&cc.db_conn, chat_id, &cc_pub).await {
         Some((_, true)) => { let _ = cc.write_err(req_id, "banned").await; return; }
         // Already a member: fall through and answer as if the join succeeded,
@@ -1039,7 +1042,7 @@ async fn handle_join_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
         Some((_, false)) => {}
         None => {
             if count_members(&cc.db_conn, chat_id).await as i64 >= MAX_CHANNEL_SUBSCRIBERS {
-                let _ = cc.write_err(req_id, "channel is full").await;
+                let _ = cc.write_err(req_id, "chat is full").await;
                 return;
             }
             let now = now_unix();
@@ -1047,17 +1050,32 @@ async fn handle_join_chat(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id
             let _guard = state.db.write_mu.lock().await;
             if let Err(e) = cc.db_conn.execute(
                 &format!("INSERT INTO \"users_{}\"(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info) VALUES(?1,?2,?3,?4,?5,0,?6) ON CONFLICT(pubkey) DO NOTHING", chat_id),
-                turso::params![cc_pub.as_slice(), "", PERM_READ_ONLY as i64, now, now, empty_info],
+                turso::params![cc_pub.as_slice(), "", user_perms, now, now, empty_info],
             ).await {
                 error!("join chat {}: {}", chat_id, e);
                 let _ = cc.write_err(req_id, "db error").await;
                 return;
             }
+            joined_now = true;
         }
     }
 
-    // Deliberately no SYS_USER_ADDED: subscribers are not announced, and at
-    // channel scale a join notice is a stored message plus a push to everyone.
+    // A group keeps its roster in sync the way it always has, so a self-join
+    // is announced like an invite-accept — the joiner is their own inviter.
+    // A channel stays silent: subscribers are not announced, and at channel
+    // scale a join notice is a stored message plus a push to everyone.
+    if joined_now && !is_channel {
+        let mut body = vec![0u8; 1 + 32 + 32 + 32];
+        body[0] = SYS_USER_ADDED;
+        body[1..33].copy_from_slice(&cc_pub);
+        body[33..65].copy_from_slice(&cc_pub);
+        body[65..97].copy_from_slice(&rand32());
+
+        let now = now_unix();
+        if let Err(e) = broadcast_system_message(state, &cc.db_conn, chat_id, &body, None, now, true).await {
+            error!("{}", e);
+        }
+    }
 
     match build_chat_info_payload(&cc.db_conn, chat_id, flags).await {
         Some(resp) => { let _ = cc.write_ok(req_id, &resp).await; }
@@ -1101,9 +1119,9 @@ async fn build_chat_info_payload(conn: &turso::Connection, chat_id: i64, flags: 
     }).ok()
 }
 
-/// Look at a public channel without joining it, so a client following an
+/// Look at a public chat without joining it, so a client following an
 /// invite link can show what it is before asking the user to commit.
-/// Public channels only: anything else would leak a private chat's name to
+/// Public chats only: anything else would leak a private chat's name to
 /// anyone who guessed its id.
 async fn handle_get_chat_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
     if !cc.is_authed().await {

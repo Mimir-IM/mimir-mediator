@@ -38,6 +38,8 @@ pub const CMD_CHANGE_MEMBER_STATUS: u8 = 0x55;
 // 0 = ordinary private group, which is what every chat created before
 // channels existed has (the column was always written as a literal 0).
 pub const CHAT_FLAG_CHANNEL: u8 = 0x01;
+/// Joinable by anyone holding the invite link, without an invite. Valid on
+/// both kinds: a public channel gains subscribers, a public group members.
 pub const CHAT_FLAG_PUBLIC: u8 = 0x02;
 
 // Response status
@@ -59,7 +61,7 @@ pub const SYS_MEMBER_ONLINE: u8 = 0x09;
 pub const MAX_NAME_LEN: usize = 25;
 pub const MAX_DESC_LEN: usize = 200;
 pub const MAX_AVATAR_BYTES: usize = 200 * 1024;
-/// Cap on how many members a channel may accumulate.
+/// Cap on how many members a chat may accumulate through self-service joins.
 pub const MAX_CHANNEL_SUBSCRIBERS: i64 = 100_000;
 pub const MAX_PAYLOAD: u32 = 51 * 1024 * 1024; // 50 MB + meta-data
 
