@@ -4,7 +4,7 @@ version = "0.3.7"
 edition = "2024"
 
 [dependencies]
-ygg_stream = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.2.7" }
+ygg_stream = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.2.8" }
 turso = { version = "0.7.0", default-features = false, features = ["mimalloc"] }
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
